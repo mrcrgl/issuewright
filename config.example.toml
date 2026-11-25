@@ -1,0 +1,95 @@
+# issuewright configuration. Copy to ~/.config/issuewright/config.toml.
+
+poll_interval_secs = 60
+# Total sessions across all repositories.
+max_sessions = 3
+# "closed": a blocker is done when it is closed as completed.
+# "merged_or_closed": also when a PR that closes it has merged into its default branch.
+blocker_done = "merged_or_closed"
+# At most this many epics in progress at once (unset = unlimited).
+# max_started_epics = 2
+notify_command = "tmux display-message 'issuewright: {name} waits for input'"
+# prompt_template = "~/.config/issuewright/prompt.md"
+# gh_user = "your-login"
+# home = "~/issuewright"
+# tmux_session = "agents"
+# branch_template = "{kind}/{number}-{slug}"
+# Close a session's window this long after its issue reached its end label
+# (dispatch:review, or a reviewer's verdict), which frees the slot.
+# Sessions normally exit on their own at that point (their Stop hook); this
+# is the fallback for when the hook couldn't decide. Unset: no fallback.
+close_done_after_secs = 600
+# Interactive mode: a session's question unanswered this long moves to GitHub
+# (comment + dispatch:needs-input), freeing the slot; dispatch:ready resumes
+# the conversation. 0 waits forever.
+question_timeout_secs = 900
+
+# An error that repeats for 3 polls raises an alarm: logged, shown in `issuewright watch`, and
+# sent with this command ({message}, or $ISSUEWRIGHT_ALARM). Again once it stops.
+alarm_command = "tmux display-message -d 15000 'issuewright: {message}'"
+alarm_after_polls = 3
+# New sessions wait while home's disk (or one of disk_paths) has less free, or while the
+# five-minute load average is higher.
+min_free_disk_gb = 10
+disk_paths = ["/"]
+# max_load = 48
+# review_prompt_template = "~/.config/issuewright/review-prompt.md"
+# For a PR that closes no issue, reviewed with the label on the PR itself.
+# pr_review_prompt_template = "~/.config/issuewright/pr-review-prompt.md"
+# When all sub-issues of an epic are closed, a session checks the epic's
+# acceptance criteria and closes it.
+# check_epics = true
+# epic_check_prompt_template = "~/.config/issuewright/epic-check-prompt.md"
+
+[env]
+CLAUDE_CODE_SUBAGENT_MODEL = "sonnet"
+
+[session]
+# Added to the built-in list (~/.ssh, ~/.kube, ~/.aws, ...).
+# deny_read = ["~/.ssh", "~/.kube", "~/.config/my-cloud"]
+# allowed_domains = ["github.com", "crates.io"]
+# deny = ["Bash(kubectl *)", "Bash(helm *)", "Bash(ansible-playbook *)"]
+# gh_token_command = "pass show github/issuewright-session"
+# ssh_agent = false
+# Permissions. Your ~/.claude/settings.json applies too; these add on top.
+# allow = ["Bash(cargo *)", "Bash(npm run *)"]
+# permission_mode = "auto"
+# Drop a built-in list entirely:
+# builtin_deny = true
+# builtin_deny_read = true
+# builtin_allowed_domains = true
+# builtin_allow = true         # CI reads, PRs, issues, push --force-with-lease
+# disable_sandbox = false
+# Raw Claude Code settings, deep-merged over the generated ones (lists replace):
+# settings_file = "~/.config/issuewright/session-settings.json"
+# [session.settings.sandbox]
+# allowUnsandboxedCommands = true
+
+# The GitHub App reviewer sessions act as, so their approval counts (the PR's
+# author can't approve it). Without it, auto_merge reviews are disabled.
+# [review_app]
+# app_id = 123456
+# private_key = "~/.config/issuewright/reviewer.pem"
+# private_key_command = "pass show github/issuewright-reviewer"
+
+[[repo]]
+name = "example/backend"
+slots = 2
+model = "opus"
+effort = "high"
+target_dir_max_gb = 60
+deny = ["Bash(./deploy.sh *)"]
+# A reviewer session reviews each finished PR; issuewright hands an approved one to
+# GitHub's auto-merge (gh pr merge --auto). Off by default.
+auto_merge = true
+# merge_method = "squash"      # or "merge", "rebase"
+# No new claims while this many issues wait for CI (dispatch:ci); CI fixes and
+# reviews still start. Unlimited by default.
+max_in_ci = 6
+# review_model = "opus"        # default: model
+# review_effort = "high"       # default: effort
+
+[[repo]]
+name = "example/web"
+slots = 1
+model = "sonnet"
