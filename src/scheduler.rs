@@ -116,6 +116,7 @@ fn counts_as_started(s: &IssueStatus) -> bool {
             RUNNING,
             CI,
             REVIEW,
+            CHANGES,
             NEEDS_INPUT,
             APPROVED,
             MERGING,
@@ -230,7 +231,7 @@ pub fn schedule(snap: &Snapshot, policy: &Policy, cap: &Capacity, hist: &History
             Some(format!(
                 "labeled {TYPE_EPIC} but has no sub-issues on GitHub; link them as sub-issues to schedule them"
             ))
-        } else if [RUNNING, NEEDS_INPUT, CI, REVIEW, APPROVED, MERGING]
+        } else if [RUNNING, NEEDS_INPUT, CI, REVIEW, CHANGES, APPROVED, MERGING]
             .iter()
             .any(|l| s.has_label(l))
         {

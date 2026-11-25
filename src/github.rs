@@ -443,6 +443,11 @@ impl Gh {
                 "1d76db",
                 "PR open; the dispatched session is finished",
             ),
+            (
+                CHANGES,
+                "e99695",
+                "The reviewer requested changes; issuewright resumes the PR's author to make them",
+            ),
             (APPROVED, "0e8a16", "The reviewer session approved the PR"),
             (
                 MERGING,

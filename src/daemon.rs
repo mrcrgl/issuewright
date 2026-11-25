@@ -624,6 +624,7 @@ impl Daemon {
             claimed = self.claim_urgent(&mut snap, &mut hist)?;
             self.check_ci(&snap)?;
             self.check_merging(&snap)?;
+            self.check_changes_requested(&snap)?;
             self.check_questions()?;
             self.start_reviews(&snap)?;
             if self.cfg.check_epics {
@@ -1613,7 +1614,8 @@ impl Daemon {
             &subject.r,
             &format!(
                 "issuewright started a reviewer session for {} at `{}` (slot {} {index}, tmux `{}:{name}`). \
-                 If it sets `{APPROVED}`, issuewright enables auto-merge on exactly that commit; otherwise it sets `{NEEDS_INPUT}`.",
+                 If it sets `{APPROVED}`, issuewright enables auto-merge on exactly that commit. If it sets `{CHANGES}`, \
+                 issuewright resumes the session that wrote the PR to make them; otherwise it sets `{NEEDS_INPUT}`.",
                 review.pr,
                 review.head_sha,
                 repo.short(),
@@ -1847,9 +1849,23 @@ impl Daemon {
                 branch: &reset.branch,
                 moved_from,
             }),
+            Wake::ChangesRequested { head_sha, round } => {
+                session::render_changes_requested_prompt(&session::ChangesRequestedVars {
+                    mode: self.opts.mode,
+                    repo: &r.repo,
+                    number: r.number,
+                    pr: &pr.r,
+                    head_sha,
+                    round: *round,
+                    max_rounds: MAX_REVIEW_ROUNDS,
+                    dir: &slot.dir,
+                    branch: &reset.branch,
+                    moved_from,
+                })
+            }
         };
         let name = r.short();
-        self.gh.edit_labels(r, &[RUNNING], &[wake.label()])?;
+        self.gh.edit_labels(r, &[RUNNING], wake.removes())?;
         let started = self.launch(
             repo,
             &slot,
@@ -1982,6 +1998,118 @@ impl Daemon {
                 ),
             ),
         }
+    }
+
+    /// Resumes the session that wrote the PR of each `dispatch:changes-requested`
+    /// issue, with the review to address. After [`MAX_REVIEW_ROUNDS`] such
+    /// rounds, or without a session to resume, the issue goes to you.
+    fn check_changes_requested(&self, snap: &Snapshot) -> Result<()> {
+        let mut w = self.state.ci_watch()?;
+        // Rounds count since the issue last went to you: closed, or waiting
+        // for you, starts over.
+        let keys: BTreeSet<String> = snap
+            .issues
+            .iter()
+            .filter(|i| i.status.state == IssueState::Open && !i.status.has_label(NEEDS_INPUT))
+            .map(|i| History::key(i.r()))
+            .collect();
+        let before = w.review_rounds.len();
+        w.review_rounds.retain(|k, _| keys.contains(k));
+        if w.review_rounds.len() != before {
+            self.state.save_ci_watch(&w)?;
+        }
+        for issue in snap
+            .issues
+            .iter()
+            .filter(|i| i.status.state == IssueState::Open && i.status.has_label(CHANGES))
+        {
+            if self
+                .state
+                .locks()?
+                .iter()
+                .any(|l| l.issue.key() == issue.r().key())
+            {
+                continue;
+            }
+            if self.backing_off(issue.r()) {
+                continue;
+            }
+            let res = self.check_changes_requested_of(issue);
+            self.attempted(issue.r(), res, "resuming for the requested changes");
+        }
+        Ok(())
+    }
+
+    fn check_changes_requested_of(&self, issue: &Issue) -> Result<()> {
+        let r = issue.r();
+        // The snapshot may predate a change by hand.
+        if !matches!(self.gh.state_and_labels(r)?, Some((true, l)) if has_label(&l, CHANGES)) {
+            return Ok(());
+        }
+        let Some(pr) = self.gh.open_pr(r)? else {
+            return self.hand_back(
+                r,
+                CHANGES,
+                &format!(
+                    "This issue is `{CHANGES}`, but no open pull request in {} closes it (`Closes #{}`) and targets the \
+                     default branch, so issuewright has no PR to send back. Open the PR and set `{CI}`, or set `{READY}` \
+                     for a new session.",
+                    r.repo, r.number
+                ),
+            );
+        };
+        let key = History::key(r);
+        let w = self.state.ci_watch()?;
+        let done = w.review_rounds.get(&key).copied().unwrap_or(0);
+        let wake = Wake::ChangesRequested {
+            head_sha: &pr.head_sha,
+            round: done + 1,
+        };
+        if done >= MAX_REVIEW_ROUNDS {
+            self.reset_review_rounds(&key)?;
+            return self.hand_back(
+                r,
+                CHANGES,
+                &format!(
+                    "{}\n\nThe reviewer has requested changes {done} times now, so issuewright stops sending \
+                     the PR back and leaves it to you. {}",
+                    wake.what(&pr.r),
+                    wake.by_hand()
+                ),
+            );
+        }
+        let Some(conv) = w.sessions.get(&key).cloned() else {
+            return self.hand_back(
+                r,
+                CHANGES,
+                &format!(
+                    "{}\n\nissuewright has no session of this issue to resume (it started before issuewright recorded \
+                     them). {}",
+                    wake.what(&pr.r),
+                    wake.by_hand()
+                ),
+            );
+        };
+        let repo = self
+            .cfg
+            .repo(&r.repo)
+            .context("repo not configured")?
+            .clone();
+        if !self.has_capacity(&repo)? {
+            return Ok(());
+        }
+        self.resume(issue, &repo, &pr, &conv, &wake)?;
+        let mut w = self.state.ci_watch()?;
+        w.review_rounds.insert(key, done + 1);
+        self.state.save_ci_watch(&w)
+    }
+
+    fn reset_review_rounds(&self, key: &str) -> Result<()> {
+        let mut w = self.state.ci_watch()?;
+        if w.review_rounds.remove(key).is_some() {
+            self.state.save_ci_watch(&w)?;
+        }
+        Ok(())
     }
 
     /// Whether `r` is still open and `dispatch:ci`, from its current labels.
@@ -2214,7 +2342,7 @@ pub fn session_done(lock: &SlotLock, snap: &Snapshot) -> bool {
     };
     match lock.kind {
         Kind::Implement => s.has_label(REVIEW) || s.has_label(CI),
-        Kind::Review => [APPROVED, MERGING, NEEDS_INPUT]
+        Kind::Review => [APPROVED, MERGING, NEEDS_INPUT, CHANGES]
             .iter()
             .any(|l| s.has_label(l)),
         Kind::EpicCheck => s.has_label(NEEDS_INPUT) || !s.has_label(RUNNING),
@@ -2269,7 +2397,14 @@ enum Wake<'a> {
     /// The approved PR at `head_sha` conflicts with the default branch; the
     /// issue was `dispatch:merging`, and its auto-merge is off now.
     Conflicts { head_sha: &'a str },
+    /// The reviewer requested changes on the PR at `head_sha`; the issue was
+    /// `dispatch:changes-requested`. `round` counts from 1.
+    ChangesRequested { head_sha: &'a str, round: u32 },
 }
+
+/// How often in a row issuewright resumes a session for the changes its
+/// reviewer requested before it hands the PR to you instead.
+const MAX_REVIEW_ROUNDS: u32 = 3;
 
 impl Wake<'_> {
     /// The label the issue carries while issuewright waits.
@@ -2277,6 +2412,18 @@ impl Wake<'_> {
         match self {
             Wake::CiFailed(_) => CI,
             Wake::Conflicts { .. } => MERGING,
+            Wake::ChangesRequested { .. } => CHANGES,
+        }
+    }
+
+    /// The labels the resumed session no longer carries. A reviewer that
+    /// requested changes may have left `dispatch:review`; the session would
+    /// then count as done at once.
+    fn removes(&self) -> &'static [&'static str] {
+        match self {
+            Wake::CiFailed(_) => &[CI],
+            Wake::Conflicts { .. } => &[MERGING],
+            Wake::ChangesRequested { .. } => &[CHANGES, REVIEW],
         }
     }
 
@@ -2292,6 +2439,9 @@ impl Wake<'_> {
                 "{pr} was approved at `{head_sha}`, but it conflicts with the default branch, so it can't merge. \
                  issuewright turned its auto-merge off, so a rebased commit can't merge on the old approval."
             ),
+            Wake::ChangesRequested { head_sha, round } => format!(
+                "The reviewer requested changes on {pr} at `{head_sha}` (round {round} of at most {MAX_REVIEW_ROUNDS})."
+            ),
         }
     }
 
@@ -2300,6 +2450,7 @@ impl Wake<'_> {
         match self {
             Wake::CiFailed(_) => "fix it",
             Wake::Conflicts { .. } => "rebase it",
+            Wake::ChangesRequested { .. } => "make them",
         }
     }
 
@@ -2312,6 +2463,10 @@ impl Wake<'_> {
             Wake::Conflicts { .. } => format!(
                 "Rebase it onto the default branch, then set `{CI}`: issuewright waits for CI and starts a fresh review."
             ),
+            Wake::ChangesRequested { .. } => format!(
+                "Read the review, then fix it and set `{CI}` for CI and a fresh review, set `{READY}` for a new session \
+                 on the branch, or replace `{NEEDS_INPUT}` with `{REVIEW}` if the review was wrong."
+            ),
         }
     }
 
@@ -2320,6 +2475,9 @@ impl Wake<'_> {
             Wake::CiFailed(c) => format!("CI failed on {pr} at {:.7}", c.head_sha),
             Wake::Conflicts { head_sha } => {
                 format!("{pr} at {head_sha:.7} conflicts with the default branch")
+            }
+            Wake::ChangesRequested { head_sha, round } => {
+                format!("changes requested on {pr} at {head_sha:.7} (round {round})")
             }
         }
     }
@@ -2367,7 +2525,7 @@ pub fn needs_review(s: &IssueStatus) -> bool {
 /// [`needs_review`] from an issue's or PR's open state and labels.
 pub fn awaits_review(open: bool, labels: &[String]) -> bool {
     open && has_label(labels, REVIEW)
-        && ![READY, RUNNING, NEEDS_INPUT, MERGING]
+        && ![READY, RUNNING, NEEDS_INPUT, CHANGES, MERGING]
             .iter()
             .any(|l| has_label(labels, l))
 }
@@ -2498,6 +2656,7 @@ mod tests {
         assert!(session_done(&l, &snap(&[REVIEW, APPROVED])));
         assert!(session_done(&l, &snap(&[MERGING])));
         assert!(session_done(&l, &snap(&[NEEDS_INPUT])));
+        assert!(session_done(&l, &snap(&[CHANGES])));
         assert!(session_done(&l, &Snapshot::default()));
     }
 
@@ -2664,11 +2823,27 @@ mod tests {
     }
 
     #[test]
+    fn changes_requested_resumes_without_review_and_names_the_round() {
+        let pr = IssueRef::new("acme/app", 9);
+        let w = Wake::ChangesRequested {
+            head_sha: "abc1234def",
+            round: 2,
+        };
+        assert_eq!(w.label(), CHANGES);
+        assert_eq!(w.removes(), &[CHANGES, REVIEW]);
+        assert!(w.what(&pr).contains("round 2 of at most 3"));
+        assert_eq!(
+            w.log(&pr),
+            "changes requested on acme/app#9 at abc1234 (round 2)"
+        );
+    }
+
+    #[test]
     fn review_needed_only_without_a_verdict_or_other_work() {
         assert!(needs_review(&issue(&[REVIEW]).status));
         // An approval nobody asked for doesn't skip the review.
         assert!(needs_review(&issue(&[REVIEW, APPROVED]).status));
-        for other in [READY, RUNNING, NEEDS_INPUT, MERGING] {
+        for other in [READY, RUNNING, NEEDS_INPUT, CHANGES, MERGING] {
             assert!(!needs_review(&issue(&[REVIEW, other]).status), "{other}");
         }
         assert!(!needs_review(&issue(&[]).status));

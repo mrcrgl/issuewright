@@ -21,9 +21,13 @@ How to review:
      1. `gh pr review {pr_number} --repo {repo} --approve --body-file -`, starting with the verdict, then findings with file and line.
      2. `gh issue edit {number} --repo {repo} --add-label dispatch:approved`.
      issuewright merges only when your approving review is on exactly `{head_sha}`.
-   - Don't merge it: for any real defect, for missing parts of the issue, for anything that needs production, and whenever you are unsure:
+   - Send it back: the PR has real defects or misses parts of the issue, and its author can fix all of them from the issue and your findings alone, without a decision from a person (bugs, missed edge cases, missing tests, broken conventions, a private name in the PR's text):
+     1. `gh pr review {pr_number} --repo {repo} --request-changes --body-file -` with the findings, each with file and line, and what has to change.
+     2. Comment on the issue what has to change and why, then `gh issue edit {number} --repo {repo} --add-label dispatch:changes-requested --remove-label dispatch:review`.
+     issuewright resumes the session that wrote the PR with your findings. It pushes, CI runs, and a fresh review follows. After a few rounds without approval, issuewright hands the PR to a person.
+   - Don't merge it: for anything that needs production, a decision the issue leaves open, or a person for any other reason, and whenever you are unsure whether the PR can be fixed without one:
      1. `gh pr review {pr_number} --repo {repo} --request-changes --body-file -` with the findings.
-     2. Comment on the issue what has to change and why, then `gh issue edit {number} --repo {repo} --add-label dispatch:needs-input --remove-label dispatch:review`.
+     2. Comment on the issue what has to change, why, and what a person has to decide, then `gh issue edit {number} --repo {repo} --add-label dispatch:needs-input --remove-label dispatch:review`.
    - Merge it later: the PR has no defect, but it must not merge before other work does. For example, it builds on another PR that isn't merged yet, or it documents or switches on behaviour that isn't live yet. Only when each piece of that work belongs to an open issue that its own PR will close. Otherwise use "don't merge it":
      1. `gh pr review {pr_number} --repo {repo} --comment --body-file -`: the review, and which issues have to land first and why.
      2. Record each of those issues as a blocker of this issue: `gh api repos/<owner>/<repo>/issues/<blocker> --jq .id` for its id, then `gh api -X POST repos/{repo}/issues/{number}/dependencies/blocked_by -F issue_id=<id>`. Name the issues, not their PRs. If a link fails, use "don't merge it" instead.

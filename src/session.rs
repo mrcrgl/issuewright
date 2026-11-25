@@ -18,6 +18,7 @@ pub const DEFAULT_PR_REVIEW_PROMPT: &str = include_str!("pr_review_prompt.md");
 pub const DEFAULT_EPIC_CHECK_PROMPT: &str = include_str!("epic_check_prompt.md");
 pub const CI_FAILED_PROMPT: &str = include_str!("ci_failed_prompt.md");
 pub const REBASE_PROMPT: &str = include_str!("rebase_prompt.md");
+pub const CHANGES_REQUESTED_PROMPT: &str = include_str!("changes_requested_prompt.md");
 pub const ANSWERED_PROMPT: &str = include_str!("answered_prompt.md");
 
 /// How a session's conversation starts.
@@ -158,6 +159,37 @@ pub fn render_rebase_prompt(v: &RebaseVars) -> String {
         .replace("{pr}", &v.pr.to_string())
         .replace("{head_sha}", v.head_sha)
         .replace("{default_branch}", v.default_branch)
+        .replace("{dir}", &v.dir.to_string_lossy())
+        .replace("{branch}", v.branch)
+        .replace("{moved_note}", &moved_note(v.moved_from))
+}
+
+/// Variables of the message that resumes a session after its reviewer
+/// requested changes.
+pub struct ChangesRequestedVars<'a> {
+    pub repo: &'a str,
+    pub mode: Mode,
+    pub number: u64,
+    pub pr: &'a IssueRef,
+    pub head_sha: &'a str,
+    /// This round, from 1, and the most there are before you are asked.
+    pub round: u32,
+    pub max_rounds: u32,
+    pub dir: &'a Path,
+    pub branch: &'a str,
+    pub moved_from: Option<&'a Path>,
+}
+
+pub fn render_changes_requested_prompt(v: &ChangesRequestedVars) -> String {
+    CHANGES_REQUESTED_PROMPT
+        .replace("{mode}", &v.mode.to_string())
+        .replace("{repo}", v.repo)
+        .replace("{number}", &v.number.to_string())
+        .replace("{pr_number}", &v.pr.number.to_string())
+        .replace("{pr}", &v.pr.to_string())
+        .replace("{head_sha}", v.head_sha)
+        .replace("{round}", &v.round.to_string())
+        .replace("{max_rounds}", &v.max_rounds.to_string())
         .replace("{dir}", &v.dir.to_string_lossy())
         .replace("{branch}", v.branch)
         .replace("{moved_note}", &moved_note(v.moved_from))
@@ -1026,6 +1058,30 @@ deny = ["Bash(rm -rf *)"]
         assert!(p.contains("`git rebase origin/main` outside the sandbox"));
         assert!(p.contains("gh issue edit 7 --repo acme/app --add-label dispatch:ci"));
         assert!(!p.contains("another directory"));
+        assert!(p.contains("runs in unattended mode"));
+        assert!(!p.contains('{'), "unrendered variable in {p}");
+    }
+
+    #[test]
+    fn changes_requested_prompt_renders_all_variables() {
+        let pr = IssueRef::new("acme/app", 9);
+        let p = render_changes_requested_prompt(&ChangesRequestedVars {
+            mode: Mode::Unattended,
+            repo: "acme/app",
+            number: 7,
+            pr: &pr,
+            head_sha: "abc123",
+            round: 2,
+            max_rounds: 3,
+            dir: Path::new("/slots/app/1"),
+            branch: "fix/7-x",
+            moved_from: Some(Path::new("/slots/app/2")),
+        });
+        assert!(p.contains("requested changes on acme/app#9 at `abc123`"));
+        assert!(p.contains("round 2 of at most 3"));
+        assert!(p.contains("gh pr view 9 --repo acme/app"));
+        assert!(p.contains("gh issue edit 7 --repo acme/app --add-label dispatch:ci"));
+        assert!(p.contains("than before (`/slots/app/2`)"));
         assert!(p.contains("runs in unattended mode"));
         assert!(!p.contains('{'), "unrendered variable in {p}");
     }

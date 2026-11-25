@@ -17,7 +17,19 @@ pub const CI: &str = "dispatch:ci";
 pub const APPROVED: &str = "dispatch:approved";
 /// Set by issuewright once it handed the approved PR to GitHub's auto-merge.
 pub const MERGING: &str = "dispatch:merging";
-pub const ALL_LABELS: [&str; 7] = [READY, RUNNING, NEEDS_INPUT, CI, REVIEW, APPROVED, MERGING];
+/// Set by a reviewer session that found defects the PR's author can fix
+/// without a decision from you: issuewright resumes the session that wrote it.
+pub const CHANGES: &str = "dispatch:changes-requested";
+pub const ALL_LABELS: [&str; 8] = [
+    READY,
+    RUNNING,
+    NEEDS_INPUT,
+    CI,
+    REVIEW,
+    CHANGES,
+    APPROVED,
+    MERGING,
+];
 
 pub const STATUS_BLOCKED: &str = "status:blocked";
 /// Marks an epic even before (or without) native sub-issues.

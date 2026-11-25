@@ -46,7 +46,12 @@ flowchart TD
         S -- "approving review<br/>+ dispatch:approved" --> S1{"App's latest review<br/>approves that commit?"}
         S1 -- "no" --> NI3
         S1 -- "yes" --> T["issuewright: gh pr merge --auto<br/>--match-head-commit, own token<br/>dispatch:merging<br/>(already green: merged at once)"]
-        S -- "review requesting changes" --> NI3["dispatch:needs-input<br/>findings on the issue"]
+        S -- "review requesting changes<br/>the author can fix" --> C1["dispatch:changes-requested<br/>findings on the PR and issue"]
+        C1 --> C2{"Under 3 rounds, and<br/>a session to resume?"}
+        C2 -- "yes, a slot is free" --> C3["issuewright resumes the session that wrote it<br/>with the review; dispatch:running"]
+        C3 --> H1
+        C2 -- "no" --> NI3
+        S -- "review requesting changes<br/>that need a person" --> NI3["dispatch:needs-input<br/>findings on the issue"]
         S -- "fine, but other issues<br/>must land first" --> S2["Review comment, blocked-by links<br/>to those issues, dispatch:ready"]
         S -- "none, session ended" --> NI3
         T --> U{"Merge accepted?"}
