@@ -1,0 +1,36 @@
+# cargo deny check: advisories, licenses, bans and sources of the dependencies.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+# Unmaintained crates warn instead of failing; vulnerabilities fail.
+unmaintained = "workspace"
+ignore = [
+  # chrono is unmaintained, with no safe upgrade; replacing it is #5.
+  { id = "RUSTSEC-2026-0543", reason = "no replacement yet, tracked in #5" },
+]
+
+[licenses]
+# Licenses compatible with MIT OR Apache-2.0.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  # webpki-roots (the root certificates)
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

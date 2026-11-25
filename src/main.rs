@@ -36,7 +36,7 @@ use crate::state::{Kind, Mode, State};
     about = "Starts one fresh Claude Code session per GitHub issue labeled dispatch:ready"
 )]
 struct Cli {
-    /// Config file [default: ~/.config/issuewright/config.toml]
+    /// Config file (default: ~/.config/issuewright/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -90,10 +90,10 @@ enum Cmd {
         /// Create it in this organization instead of your personal account.
         #[arg(long)]
         org: Option<String>,
-        /// The app's name [default: `<org or login>-issuewright`].
+        /// The app's name (default: `<org or login>-issuewright`).
         #[arg(long)]
         name: Option<String>,
-        /// Local port for GitHub's redirect [default: any free one].
+        /// Local port for GitHub's redirect (default: any free one).
         #[arg(long, default_value_t = 0)]
         port: u16,
     },

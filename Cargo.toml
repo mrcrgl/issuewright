@@ -1,7 +1,8 @@
 [package]
 name = "issuewright"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Starts one fresh Claude Code session per GitHub issue labeled dispatch:ready"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mrcrgl/issuewright"
