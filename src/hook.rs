@@ -31,7 +31,8 @@ use crate::tmux;
 /// - An implement or epic-check session is finished once its issue left
 ///   `dispatch:running`: it went to `dispatch:review` (PR up, CI green),
 ///   `dispatch:needs-input` (a question, or a dead end), or was split.
-/// - A reviewer session is finished at its verdict, or once the subject left
+/// - A reviewer session is finished at its verdict (approval, changes
+///   requested, or handed back to you), or once the subject left
 ///   `dispatch:review`.
 /// - Any session is finished once its subject is closed.
 pub fn finished(kind: Kind, open: bool, labels: &[String]) -> Option<&'static str> {
@@ -56,7 +57,7 @@ pub fn finished(kind: Kind, open: bool, labels: &[String]) -> Option<&'static st
         Kind::Review => {
             if has(APPROVED) || has(MERGING) {
                 Some("it approved the PR")
-            } else if has(NEEDS_INPUT) {
+            } else if has(NEEDS_INPUT) || has(CHANGES) {
                 Some("it handed the PR back")
             } else if !has(REVIEW) {
                 Some("its subject is no longer dispatch:review")
@@ -179,6 +180,7 @@ mod tests {
         assert!(finished(k, true, &l(&[REVIEW, APPROVED])).is_some());
         assert!(finished(k, true, &l(&[NEEDS_INPUT])).is_some());
         assert!(finished(k, true, &l(&[MERGING])).is_some());
+        assert!(finished(k, true, &l(&[REVIEW, CHANGES])).is_some());
         // Merge later: released to wait on the blockers it recorded.
         assert!(finished(k, true, &l(&[READY])).is_some());
         assert!(finished(k, false, &l(&[REVIEW])).is_some());

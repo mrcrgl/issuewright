@@ -100,6 +100,10 @@ pub struct CiWatch {
     /// next claim resumes that conversation.
     #[serde(default)]
     pub asked: BTreeMap<String, Asked>,
+    /// How often issuewright resumed each issue's session because its
+    /// reviewer requested changes, since it last went to you.
+    #[serde(default)]
+    pub review_rounds: BTreeMap<String, u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

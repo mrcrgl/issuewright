@@ -762,11 +762,12 @@ fn target(r: &IssueRef) -> Option<Target> {
     })
 }
 
-const STAGES: [(&str, Color); 6] = [
+const STAGES: [(&str, Color); 7] = [
     (NEEDS_INPUT, Color::Yellow),
     (RUNNING, Color::Cyan),
     (CI, Color::Blue),
     (REVIEW, Color::Magenta),
+    (CHANGES, Color::Yellow),
     (APPROVED, Color::Green),
     (MERGING, Color::Green),
 ];

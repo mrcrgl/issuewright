@@ -362,7 +362,7 @@ fn classify(n: &Node, verdict: Option<&Verdict>) -> End {
     if n.has(STATUS_BLOCKED) {
         return End::Parked;
     }
-    if let Some(l) = [RUNNING, CI, REVIEW, APPROVED, MERGING]
+    if let Some(l) = [RUNNING, CI, REVIEW, CHANGES, APPROVED, MERGING]
         .iter()
         .find(|l| n.has(l))
     {
