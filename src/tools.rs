@@ -15,7 +15,7 @@
 //! The session writes that command line, arguments and environment
 //! included, so none of them are trusted. The session is found by its key
 //! (`ISSUEWRIGHT_SESSION_KEY`, set when issuewright starts it) in a record issuewright
-//! writes under the user's home as passwd names it, in a directory every
+//! writes under the user's home as the user database names it, in a directory every
 //! session's sandbox denies reading and writing. git runs in the slot the
 //! record names, with a fixed environment and without hooks.
 
@@ -68,7 +68,7 @@ pub struct Record {
 }
 
 /// Where the records live: `~/.local/state/issuewright/sessions`, with the home
-/// directory from passwd, not `$HOME`.
+/// directory from the user database, not `$HOME`.
 pub fn records_dir() -> Result<PathBuf> {
     Ok(user_home()?.join(".local/state/issuewright/sessions"))
 }
@@ -142,9 +142,10 @@ pub fn run(tool: Tool) -> Result<()> {
 }
 
 /// git in the session's slot: a fixed environment (the caller's could point
-/// git at other config or programs), the user's own home from passwd, and
+/// git at other config or programs), the user's own home from the user database, and
 /// no hooks or fsmonitor (the session can write the shared git directory).
 struct Git {
+    bin: PathBuf,
     dir: PathBuf,
     home: PathBuf,
     ssh_auth_sock: Option<String>,
@@ -154,6 +155,7 @@ struct Git {
 impl Git {
     fn new(rec: &Record) -> Result<Self> {
         Ok(Self {
+            bin: trusted_bin("git")?,
             dir: rec.dir.clone(),
             home: user_home()?,
             // Commit signing with an SSH key goes through the agent.
@@ -165,9 +167,9 @@ impl Git {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new("/usr/bin/git");
+        let mut c = Command::new(&self.bin);
         c.env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("PATH", TRUSTED_PATH)
             .env("HOME", &self.home)
             .env("LANG", "C.UTF-8")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -380,24 +382,46 @@ fn http_error(e: ureq::Error) -> anyhow::Error {
     }
 }
 
-/// The user's home directory as passwd names it.
+/// The user's home directory as the user database names it (`getpwuid_r`:
+/// `/etc/passwd` on Linux, Directory Services on macOS), never `$HOME`.
 pub fn user_home() -> Result<PathBuf> {
-    let status = std::fs::read_to_string("/proc/self/status")?;
-    let uid = status
-        .lines()
-        .find_map(|l| l.strip_prefix("Uid:"))
-        .and_then(|l| l.split_whitespace().next())
-        .context("no Uid in /proc/self/status")?
-        .to_string();
-    let passwd = std::fs::read_to_string("/etc/passwd")?;
-    home_of(&passwd, &uid).with_context(|| format!("uid {uid} has no entry in /etc/passwd"))
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: getuid can't fail.
+    let uid = unsafe { libc::getuid() };
+    let mut buf: Vec<libc::c_char> = vec![0; 1024];
+    loop {
+        // SAFETY: an all-zero passwd is a valid value to be filled in.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: pwd, buf and found are valid for the call, and buf.len()
+        // is the buffer's real length.
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut found) };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+            bail!("uid {uid} has no entry in the user database");
+        }
+        // SAFETY: pw_dir points into buf, NUL-terminated, while buf lives.
+        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+        return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())));
+    }
 }
 
-fn home_of(passwd: &str, uid: &str) -> Option<PathBuf> {
-    passwd.lines().find_map(|l| {
-        let f: Vec<&str> = l.split(':').collect();
-        (f.len() >= 6 && f[2] == uid).then(|| PathBuf::from(f[5]))
-    })
+/// Where the commands run outside the sandbox come from: system and package
+/// manager directories, which sessions can't write. The session's `PATH`
+/// isn't used.
+const TRUSTED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+
+/// The first `name` in the trusted directories.
+fn trusted_bin(name: &str) -> Result<PathBuf> {
+    TRUSTED_PATH
+        .split(':')
+        .map(|d| Path::new(d).join(name))
+        .find(|p| p.is_file())
+        .with_context(|| format!("no {name} in {TRUSTED_PATH}"))
 }
 
 /// What a session is told about these commands, appended to its system
@@ -484,11 +508,11 @@ mod tests {
     }
 
     #[test]
-    fn home_comes_from_passwd() {
-        let p = "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n";
-        assert_eq!(home_of(p, "1000"), Some(PathBuf::from("/home/alice")));
-        assert_eq!(home_of(p, "1001"), None);
-        assert!(user_home().unwrap().is_absolute());
+    fn home_comes_from_the_user_database() {
+        let home = user_home().unwrap();
+        assert!(home.is_absolute(), "{}", home.display());
+        assert!(trusted_bin("git").unwrap().is_absolute());
+        assert!(trusted_bin("no-such-program-here").is_err());
     }
 
     #[test]
@@ -526,6 +550,7 @@ mod tests {
         );
         // The test's git has no identity or signing config of the user's.
         let git = Git {
+            bin: trusted_bin("git").unwrap(),
             dir: slot.clone(),
             home: d.clone(),
             ssh_auth_sock: None,

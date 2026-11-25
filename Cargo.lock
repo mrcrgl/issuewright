@@ -647,6 +647,7 @@ dependencies = [
  "chrono",
  "clap",
  "jsonwebtoken",
+ "libc",
  "ratatui",
  "regex",
  "serde",

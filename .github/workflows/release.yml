@@ -1,7 +1,7 @@
 name: Release
 
 # A `v*` tag on main publishes that version: the CI gates run on the tagged
-# commit, static Linux binaries are built, the crate goes to crates.io and a
+# commit, Linux (static) and macOS binaries are built, the crate goes to crates.io and a
 # GitHub Release gets the binaries.
 #
 # Anything else is a dry run, up to the binaries: a PR that changes this
@@ -73,11 +73,17 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          # Cross-built on Apple silicon; Xcode's clang builds ring for it.
+          - target: x86_64-apple-darwin
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       # ring compiles C, with musl-gcc for a static binary.
       - name: musl toolchain
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: dtolnay/rust-toolchain@stable
@@ -97,9 +103,12 @@ jobs:
           mkdir "$name"
           cp target/${{ matrix.target }}/release/issuewright README.md LICENSE-MIT LICENSE-APACHE "$name/"
           file "$name/issuewright"
-          "$name/issuewright" --version
+          # A cross-built binary can't run here.
+          if [ "${{ matrix.target }}" != x86_64-apple-darwin ]; then
+            "$name/issuewright" --version
+          fi
           tar -czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
