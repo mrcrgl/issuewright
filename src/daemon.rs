@@ -91,7 +91,17 @@ fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
 }
 
 fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // Signal 0 only checks that the process exists. EPERM means it does,
+    // but belongs to someone else.
+    // SAFETY: kill with signal 0 sends nothing.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 impl Daemon {

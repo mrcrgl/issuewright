@@ -222,31 +222,28 @@ pub fn load_hold(max_load: Option<f64>) -> Option<String> {
     (load > max).then(|| format!("load average {load:.0}, max_load is {max:.0}"))
 }
 
-/// Free bytes on the file system of `p` (`df`), `None` when unknown.
+/// Free bytes on the file system of `p` (POSIX `df -Pk`), `None` when
+/// unknown.
 fn free_bytes(p: &Path) -> Option<u64> {
-    let out = Command::new("df")
-        .args(["-B1", "--output=avail"])
-        .arg(p)
-        .output()
-        .ok()?;
+    let out = Command::new("df").arg("-Pk").arg(p).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .nth(1)?
-        .trim()
-        .parse()
-        .ok()
+    parse_df(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The "Available" column (KiB) of `df -Pk`'s one line, in bytes.
+fn parse_df(s: &str) -> Option<u64> {
+    let kib: u64 = s.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(kib.saturating_mul(1024))
 }
 
 /// The five-minute load average.
 fn load_average() -> Option<f64> {
-    parse_loadavg(&std::fs::read_to_string("/proc/loadavg").ok()?)
-}
-
-fn parse_loadavg(s: &str) -> Option<f64> {
-    s.split_whitespace().nth(1)?.parse().ok()
+    let mut avg = [0f64; 3];
+    // SAFETY: the buffer holds the three values asked for.
+    let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
+    (n >= 2).then_some(avg[1])
 }
 
 /// Runs the alarm command with the message as `{message}` (quotes and shell
@@ -340,7 +337,13 @@ mod tests {
 
     #[test]
     fn load_and_disk() {
-        assert_eq!(parse_loadavg("12.5 30.25 8.0 3/900 123"), Some(30.25));
+        assert_eq!(
+            parse_df(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 100 40 60 40% /\n"
+            ),
+            Some(60 * 1024)
+        );
+        assert!(load_average().is_some_and(|l| l >= 0.0));
         assert!(free_bytes(Path::new("/")).is_some());
         assert!(disk_hold(&[PathBuf::from("/")], 0).is_none());
         assert!(load_hold(None).is_none());

@@ -28,11 +28,29 @@ pub enum Start<'a> {
     Resume(&'a str),
 }
 
-/// A fresh session id: a random UUID, from the kernel.
+/// A fresh session id: a random (version 4) UUID.
 pub fn new_session_id() -> Result<String> {
-    let id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-        .context("reading /proc/sys/kernel/random/uuid")?;
-    Ok(id.trim().to_string())
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .context("reading /dev/urandom")?;
+    Ok(uuid_v4(b))
+}
+
+/// Formats 16 random bytes as a version 4 UUID.
+fn uuid_v4(mut b: [u8; 16]) -> String {
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// Where Claude Code keeps the transcripts of sessions started in `dir`:
@@ -1052,6 +1070,16 @@ deny = ["Bash(rm -rf *)"]
                 .iter()
                 .any(|a| a.as_str().unwrap().contains("session"))
         );
+    }
+
+    #[test]
+    fn session_ids_are_v4_uuids() {
+        assert_eq!(uuid_v4([0xff; 16]), "ffffffff-ffff-4fff-bfff-ffffffffffff");
+        assert_eq!(uuid_v4([0; 16]), "00000000-0000-4000-8000-000000000000");
+        let (a, b) = (new_session_id().unwrap(), new_session_id().unwrap());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4");
     }
 
     #[test]
