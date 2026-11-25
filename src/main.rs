@@ -12,6 +12,7 @@ mod hook;
 mod model;
 mod scheduler;
 mod session;
+mod setup_app;
 mod slots;
 mod state;
 mod stats;
@@ -83,6 +84,19 @@ enum Cmd {
         #[arg(long)]
         review: bool,
     },
+    /// Create the review app on GitHub with a prefilled manifest, save its
+    /// key next to the config and add `[review_app]` to it.
+    SetupApp {
+        /// Create it in this organization instead of your personal account.
+        #[arg(long)]
+        org: Option<String>,
+        /// The app's name [default: `<org or login>-issuewright`].
+        #[arg(long)]
+        name: Option<String>,
+        /// Local port for GitHub's redirect [default: any free one].
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
     /// Commands a session runs outside its sandbox, on its own slot only.
     /// issuewright tells its sessions about them; they need the session's key.
     Session {
@@ -119,6 +133,10 @@ fn main() -> Result<()> {
         c => c,
     };
     let config_path = cli.config.unwrap_or_else(default_config_path);
+    // Works before there is a config.
+    if let Cmd::SetupApp { org, name, port } = command {
+        return setup_app::run(&config_path, setup_app::Options { org, name, port });
+    }
     let cfg = Config::load(&config_path)?;
     match command {
         Cmd::Run {
@@ -145,7 +163,7 @@ fn main() -> Result<()> {
         Cmd::Status => status(&cfg),
         Cmd::Stats { days, no_tokens } => stats::print(&cfg, days, !no_tokens),
         Cmd::Watch => watch::run(&cfg),
-        Cmd::Session { .. } => unreachable!("handled above"),
+        Cmd::Session { .. } | Cmd::SetupApp { .. } => unreachable!("handled above"),
         Cmd::StopHook { repo, slot } => hook::run(&cfg, &repo, slot),
         Cmd::PromptHook { repo, slot } => hook::answered(&cfg, &repo, slot),
         Cmd::ShowSession {
