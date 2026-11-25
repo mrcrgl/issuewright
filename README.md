@@ -202,6 +202,19 @@ At start, issuewright prints a warning for each `auto_merge` repository where th
 
 GitHub doesn't count an approval from the PR's author, and sessions open PRs under your account. So reviewers act as a GitHub App, whose approval counts toward required reviews. Without `[review_app]`, reviews are disabled.
 
+The quick way:
+
+```
+issuewright setup-app                # in your personal account
+issuewright setup-app --org acme     # or in an organization
+```
+
+It opens GitHub's "new app" page with the name (`<login or org>-issuewright`, or `--name`), the permissions below and a disabled webhook filled in. Click **Create GitHub App**. GitHub hands the app's id and private key back to issuewright, which saves the key next to the config (mode 600) and adds `[review_app]` to the config. Then it opens the install page, where you pick the repositories with `auto_merge`. It never replaces an existing `[review_app]`.
+
+It needs a browser that reaches `127.0.0.1` on this machine. On a remote machine, forward the port it prints (`ssh -L <port>:127.0.0.1:<port> <host>`, with a fixed `--port` if you like). If the redirect at the end still doesn't arrive, paste the URL the browser shows into the terminal.
+
+Or by hand:
+
 1. Create a GitHub App (your org's Settings → Developer settings → GitHub Apps → New). Name it, for example, `<org>-issuewright-reviewer`. Disable the webhook. Repository permissions:
    - Pull requests: read and write (to approve or request changes)
    - Contents: read and write. GitHub counts an approval toward required reviews only from a reviewer with write access, and for an app that is this permission. With read-only, its approval shows on the PR but the PR stays blocked. The reviewer can't use the write access to merge unreviewed code: its sessions can't `git push` or `git commit`, and issuewright merges only the exact commit the app approved.
