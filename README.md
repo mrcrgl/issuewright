@@ -19,7 +19,7 @@ issuewright is the tool I run my own repositories with, shared as is. It fits on
 
 - Linux, with `git`, `gh` (logged in), `tmux` and `claude` (logged in to claude.ai, for Remote Control) on `PATH`
 - `bubblewrap` and `socat` for Claude Code's sandbox: `sudo apt-get install bubblewrap socat`
-- Rust, to build: `cargo install --path .`
+- To install: `cargo install issuewright` (Rust 1.89 or newer), or a static binary for x86_64 or aarch64 from the [releases](https://github.com/mrcrgl/issuewright/releases)
 
 Tested with Claude Code 2.1.325, gh 2.x and tmux 3.5a.
 
@@ -345,7 +345,21 @@ ISSUEWRIGHT_LIVE_REPO=owner/name ISSUEWRIGHT_LIVE_LABEL=some-label \
   cargo test live -- --ignored --nocapture   # the GraphQL queries against GitHub
 ```
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on every pull request and on pushes to `main`. Run the same three before pushing.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull request and on pushes to `main`, and a PR merges only when it passes:
+
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`
+- `cargo test` on the minimum supported Rust version, 1.89 (`rust-version` in `Cargo.toml`)
+- `cargo package`, which builds the crate as crates.io gets it, and `cargo doc` without warnings
+- `cargo deny check`: advisories, licenses, duplicate and unknown-source dependencies ([`deny.toml`](deny.toml))
+
+Run the first three before pushing. Dependabot proposes dependency and Actions updates weekly.
+
+### Releasing
+
+1. Bump `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, and merge that through a PR.
+2. Tag the merge commit on `main` and push the tag: `git tag v0.2.0 && git push origin v0.2.0`.
+
+The tag starts [`.github/workflows/release.yml`](.github/workflows/release.yml). It checks that the tag matches the version and is on `main`, runs the CI gates on the tagged commit, builds static Linux binaries (x86_64, aarch64), publishes the crate to crates.io, and creates a GitHub Release with the binaries, their SHA-256 checksums and generated notes. crates.io trusts the workflow through [Trusted Publishing](https://crates.io/docs/trusted-publishing), so no token is stored in the repository. A PR that changes the workflow or the manifest runs it as a dry run, up to the binaries.
 
 The scheduler (`src/scheduler.rs`) is a pure function from a snapshot of issues to an ordered plan, and is unit-tested without GitHub.
 
