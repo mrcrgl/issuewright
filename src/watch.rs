@@ -1,7 +1,7 @@
 //! `issuewright watch`: a screen to keep open beside the daemon. It shows the
-//! sessions in the slots, the issues further down the pipeline, and for every
-//! ready issue that waits on a blocker, the issue its chain of blockers ends
-//! at, with the ends that won't move until you act at the top.
+//! running sessions, the work in flight, and everything that needs you: the
+//! questions, the reviews that are yours, and the ends of chains of blockers
+//! that won't move until you act, those that free the most work first.
 //!
 //! Its Stats tab (`4`) shows throughput and efficiency per day, from the
 //! daemon's log and the slots' transcripts (see [`crate::stats`]).
@@ -27,7 +27,6 @@ use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Paragraph, Row, Table, Wr
 use crate::config::Config;
 use crate::graph::{self, End, Stall};
 use crate::model::*;
-use crate::scheduler::Verdict;
 use crate::state::{Kind, SlotLock, State, Status, Waiting};
 use crate::stats::{self, Day, Tokens};
 use crate::tmux;
@@ -129,6 +128,28 @@ impl View {
         ls.into_iter().find_map(|l| l.tmux_window.clone())
     }
 
+    /// The newest log line about `r` that `want` accepts, with its time.
+    fn last_event_of(
+        &self,
+        r: &IssueRef,
+        want: impl Fn(stats::Kind) -> bool,
+    ) -> Option<DateTime<Utc>> {
+        let key = format!(
+            "{}#{}",
+            r.repo.rsplit('/').next().unwrap_or(&r.repo),
+            r.number
+        );
+        self.log.iter().rev().find_map(|(t, l)| {
+            let (k, kind) = stats::classify(l)?;
+            (k.eq_ignore_ascii_case(&key) && want(kind)).then_some(*t)
+        })
+    }
+
+    /// When the log last said something about `r`.
+    fn last_event(&self, r: &IssueRef) -> Option<DateTime<Utc>> {
+        self.last_event_of(r, |_| true)
+    }
+
     fn waiting_of(&self, l: &SlotLock) -> Option<&Waiting> {
         self.waiting.get(&(l.repo.to_lowercase(), l.slot))
     }
@@ -167,6 +188,23 @@ impl View {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+/// Widest a repository's or issue's name gets in a column; longer ones are
+/// cut short in the repository part, keeping the number.
+const NAME_MAX: usize = 22;
+
+/// `name` cut to `max` characters with `…`, keeping a `#number` suffix.
+fn clip(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_string();
+    }
+    let (repo, num) = match name.rfind('#') {
+        Some(i) => name.split_at(i),
+        None => (name, ""),
+    };
+    let keep = max.saturating_sub(num.chars().count() + 1);
+    format!("{}…{num}", repo.chars().take(keep).collect::<String>())
 }
 
 /// The log's last lines with their time, skipping lines without one (the
@@ -257,7 +295,7 @@ impl Rows {
     }
 }
 
-const PANES: [&str; 3] = ["Sessions", "Pipeline", "Blockers"];
+const PANES: [&str; 3] = ["Sessions", "Pipeline", "Needs you"];
 
 #[derive(Default)]
 struct App {
@@ -302,8 +340,8 @@ fn run_loop(cfg: &Config, term: &mut DefaultTerminal) -> Result<()> {
     loop {
         let panes = [
             session_rows(cfg, &view),
-            pipeline_rows(&view),
-            dependency_rows(&view),
+            pipeline_rows(cfg, &view),
+            needs_you_rows(cfg, &view),
         ];
         if app.stats_tab {
             stats.refresh(cfg);
@@ -434,23 +472,31 @@ fn draw(f: &mut Frame, cfg: &Config, v: &View, panes: &[Rows; 3], app: &mut App)
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(upper);
 
     f.render_widget(Paragraph::new(header), head);
-    let stuck = v.stalls.iter().filter(|s| !s.end.flows()).count();
-    let blockers_title = if stuck > 0 {
+    let asks = panes[2].targets.iter().filter(|t| t.is_some()).count();
+    let needs_title = if asks > 0 {
         vec![
-            " 3 Blockers ".into(),
-            Span::styled(
-                format!(" {stuck} stuck "),
-                Style::new().white().on_red().bold(),
-            ),
+            " 3 Needs you ".into(),
+            Span::styled(format!(" {asks} "), Style::new().black().on_yellow().bold()),
             " ".into(),
         ]
     } else {
-        vec![" 3 Blockers ".into()]
+        vec![" 3 Needs you ".into()]
     };
+    let counts = pipeline_counts(v);
     let titles = [
-        vec![" 1 Sessions ".into()],
-        vec![" 2 Pipeline ".into()],
-        blockers_title,
+        vec![format!(" 1 Sessions  {}/{slots} ", v.locks.len()).into()],
+        vec![
+            " 2 Pipeline ".into(),
+            Span::styled(
+                if counts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {counts} ")
+                },
+                dim(),
+            ),
+        ],
+        needs_title,
     ];
     for (i, area) in [sessions, pipe, deps].into_iter().enumerate() {
         pane(f, area, titles[i].clone(), &panes[i], app, i);
@@ -699,68 +745,91 @@ fn sparkline(
         .collect()
 }
 
+/// The busy slots, those asking you first, then the oldest; the free ones
+/// in one line at the end, so the active sessions always fit.
 fn session_rows(cfg: &Config, v: &View) -> Rows {
     let mut out = Rows::default();
-    for r in &cfg.repos {
-        for i in 1..=r.slots {
-            let slot = format!("{:<10} {i} ", v.repo(r.short()));
-            let Some(l) = v
+    let mut busy: Vec<&SlotLock> = v.locks.iter().collect();
+    busy.sort_by_key(|l| (v.waiting_of(l).is_none(), l.started_at));
+    let w = busy
+        .iter()
+        .map(|l| v.repo(&l.repo).chars().count())
+        .max()
+        .unwrap_or(0);
+    for l in busy {
+        let slot = format!("{:<w$} {} ", v.repo(&l.repo), l.slot);
+        let alive = match (&l.tmux_window, &v.windows) {
+            (Some(w), Some(ws)) if !ws.contains(w) => Some("ended"),
+            _ => None,
+        };
+        let done = l.done_since.is_some()
+            || v.status
+                .done_waiting_to_close
+                .iter()
+                .any(|d| d.key() == l.issue.key());
+        let mut spans = vec![
+            Span::raw(slot),
+            Span::styled(format!("{:<10}", l.kind.to_string()), kind_style(l)),
+            Span::styled(format!("#{:<6}", l.issue.number), Style::new().bold()),
+            Span::styled(format!("{:>6} ", ago(l.started_at)), dim()),
+        ];
+        if let Some(a) = alive {
+            spans.push(Span::styled(format!("{a} "), Style::new().yellow()));
+        } else if let Some(w) = v.waiting_of(l) {
+            spans.push(Span::styled(
+                format!("asks you {} ", ago(w.since)),
+                Style::new().black().on_yellow().bold(),
+            ));
+            let note = match w.nudged_at {
+                Some(_) => "moving it to GitHub ".to_string(),
+                None if v.question_timeout > 0 => {
+                    let left = v.question_timeout as i64 - (Utc::now() - w.since).num_seconds();
+                    format!(
+                        "GitHub in {} ",
+                        ago(Utc::now() - chrono::Duration::seconds(left.max(0)))
+                    )
+                }
+                None => String::new(),
+            };
+            spans.push(Span::styled(note, Style::new().yellow()));
+        } else if done {
+            spans.push(Span::styled("done ", Style::new().green()));
+        }
+        spans.push(Span::styled(title_of(v, &l.issue), dim()));
+        out.push(
+            Line::from(spans),
+            Some(Target {
+                issue: l.issue.clone(),
+                window: l.tmux_window.clone(),
+            }),
+        );
+    }
+    let free: Vec<String> = cfg
+        .repos
+        .iter()
+        .flat_map(|r| {
+            let used = v
                 .locks
                 .iter()
-                .find(|l| l.repo.eq_ignore_ascii_case(&r.name) && l.slot == i)
-            else {
-                out.push(
-                    Line::from(vec![Span::styled(slot, dim()), Span::styled("free", dim())]),
-                    None,
-                );
-                continue;
-            };
-            let alive = match (&l.tmux_window, &v.windows) {
-                (Some(w), Some(ws)) if !ws.contains(w) => Some("ended"),
-                _ => None,
-            };
-            let done = l.done_since.is_some()
-                || v.status
-                    .done_waiting_to_close
-                    .iter()
-                    .any(|d| d.key() == l.issue.key());
-            let mut spans = vec![
-                Span::raw(slot),
-                Span::styled(format!("{:<10}", l.kind.to_string()), kind_style(l)),
-                Span::styled(format!("#{:<6}", l.issue.number), Style::new().bold()),
-                Span::styled(format!("{:>6} ", ago(l.started_at)), dim()),
-            ];
-            if let Some(a) = alive {
-                spans.push(Span::styled(format!("{a} "), Style::new().yellow()));
-            } else if let Some(w) = v.waiting_of(l) {
-                spans.push(Span::styled(
-                    format!("asks you {} ", ago(w.since)),
-                    Style::new().black().on_yellow().bold(),
-                ));
-                let note = match w.nudged_at {
-                    Some(_) => "moving it to GitHub ".to_string(),
-                    None if v.question_timeout > 0 => {
-                        let left = v.question_timeout as i64 - (Utc::now() - w.since).num_seconds();
-                        format!(
-                            "GitHub in {} ",
-                            ago(Utc::now() - chrono::Duration::seconds(left.max(0)))
-                        )
-                    }
-                    None => String::new(),
-                };
-                spans.push(Span::styled(note, Style::new().yellow()));
-            } else if done {
-                spans.push(Span::styled("done ", Style::new().green()));
-            }
-            spans.push(Span::styled(title_of(v, &l.issue), dim()));
-            out.push(
-                Line::from(spans),
-                Some(Target {
-                    issue: l.issue.clone(),
-                    window: l.tmux_window.clone(),
-                }),
-            );
-        }
+                .filter(|l| l.repo.eq_ignore_ascii_case(&r.name))
+                .count();
+            let n = r.slots.saturating_sub(used);
+            let name = v.repo(r.short()).to_string();
+            (n > 0).then(|| if n > 1 { format!("{name} ×{n}") } else { name })
+        })
+        .collect();
+    if !free.is_empty() {
+        let n: usize = cfg.repos.iter().map(|r| r.slots).sum::<usize>() - v.locks.len();
+        out.push(
+            Line::from(vec![
+                Span::styled(
+                    format!("{n} free  "),
+                    Style::new().bold().fg(Color::DarkGray),
+                ),
+                Span::styled(free.join(", "), dim()),
+            ]),
+            None,
+        );
     }
     out
 }
@@ -789,17 +858,26 @@ fn target(r: &IssueRef) -> Option<Target> {
     })
 }
 
-const STAGES: [(&str, Color); 7] = [
-    (NEEDS_INPUT, Color::Yellow),
-    (RUNNING, Color::Cyan),
-    (CI, Color::Blue),
-    (REVIEW, Color::Magenta),
-    (CHANGES, Color::Yellow),
-    (APPROVED, Color::Green),
+/// Work in flight, closest to merged first.
+const STAGES: [(&str, Color); 6] = [
     (MERGING, Color::Green),
+    (APPROVED, Color::Green),
+    (CHANGES, Color::Yellow),
+    (REVIEW, Color::Magenta),
+    (CI, Color::Blue),
+    (RUNNING, Color::Cyan),
 ];
 
-fn pipeline_rows(v: &View) -> Rows {
+/// The repositories whose PRs a person reviews: no `auto_merge`.
+fn reviewed_by_you<'a>(cfg: &'a Config) -> impl Fn(&IssueRef) -> bool + 'a {
+    move |r: &IssueRef| {
+        cfg.repos
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&r.repo) && !c.auto_merge)
+    }
+}
+
+fn pipeline_rows(cfg: &Config, v: &View) -> Rows {
     let mut out = Rows::default();
     if v.status.graph.is_empty() && !v.status.plan.entries.is_empty() {
         out.push(
@@ -808,33 +886,46 @@ fn pipeline_rows(v: &View) -> Rows {
         );
         return out;
     }
+    let by_you = reviewed_by_you(cfg);
+    let w = v
+        .status
+        .graph
+        .iter()
+        .filter(|n| STAGES.iter().any(|(l, _)| n.has(l)))
+        .map(|n| v.name(&n.issue).chars().count().min(NAME_MAX))
+        .max()
+        .unwrap_or(0);
     for (label, color) in STAGES {
-        for n in v
+        let mut here: Vec<&graph::Node> = v
             .status
             .graph
             .iter()
-            .filter(|n| n.has(label) && n.state == IssueState::Open)
-        {
-            let stage = label.trim_start_matches("dispatch:");
+            .filter(|n| n.has(label) && n.state == IssueState::Open && !n.has(NEEDS_INPUT))
+            .collect();
+        // Oldest first: what sat longest is at the top of its stage.
+        here.sort_by_key(|n| v.last_event(&n.issue));
+        for n in here {
+            let mut stage = label.trim_start_matches("dispatch:").to_string();
+            if label == REVIEW && by_you(&n.issue) {
+                stage.push_str(" (you)");
+            }
+            let since = v
+                .last_event(&n.issue)
+                .map(ago)
+                .unwrap_or_else(|| "–".into());
             out.push(
                 Line::from(vec![
-                    Span::styled(format!("{stage:<12}"), Style::new().fg(color)),
-                    Span::styled(format!("{:<16} ", v.name(&n.issue)), Style::new().bold()),
+                    Span::styled(format!("{stage:<13}"), Style::new().fg(color)),
+                    Span::styled(
+                        format!("{:<w$} ", clip(&v.name(&n.issue), NAME_MAX)),
+                        Style::new().bold(),
+                    ),
+                    Span::styled(format!("{since:>5}  "), dim()),
                     Span::styled(n.title.clone(), dim()),
                 ]),
                 target(&n.issue),
             );
         }
-    }
-    let ready = v.status.plan.entries.len();
-    if ready > 0 {
-        out.push(
-            Line::from(vec![
-                Span::styled(format!("{:<12}", "ready"), Style::new().white()),
-                Span::styled(format!("{ready} issue(s), see Blockers"), dim()),
-            ]),
-            None,
-        );
     }
     if out.lines.is_empty() {
         out.push(Line::styled("nothing in flight", dim()), None);
@@ -842,140 +933,187 @@ fn pipeline_rows(v: &View) -> Rows {
     out
 }
 
-fn end_style(e: &End) -> (&'static str, Style) {
-    let style = match e {
-        End::Moving(_) => Style::new().green(),
-        End::Queued(_) => Style::new().cyan(),
-        End::NeedsInput => Style::new().yellow().bold(),
-        End::Parked | End::Skipped(_) => Style::new().yellow(),
-        End::Unowned | End::Dead | End::Unresolvable(_) | End::Cycle(_) => {
-            Style::new().red().bold()
-        }
-    };
-    (e.mark(), style)
+/// How many of each stage are in flight, for the pane's title.
+fn pipeline_counts(v: &View) -> String {
+    STAGES
+        .iter()
+        .filter_map(|(label, _)| {
+            let n = v
+                .status
+                .graph
+                .iter()
+                .filter(|n| n.has(label) && n.state == IssueState::Open && !n.has(NEEDS_INPUT))
+                .count();
+            (n > 0).then(|| format!("{n} {}", label.trim_start_matches("dispatch:")))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
-fn dependency_rows(v: &View) -> Rows {
-    let mut out = Rows::default();
-    if v.status.graph.is_empty() && !v.status.plan.entries.is_empty() {
-        out.push(
-            Line::styled(
-                "This issuewright doesn't record blockers yet; restart it after `cargo install --path .`.",
-                Style::new().yellow(),
-            ),
-            None,
-        );
-    }
-    let heading = |text: &'static str, style: Style| {
-        Line::styled(
-            text,
-            style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )
-    };
-    let mut flowing_header = false;
-    if v.stalls.iter().any(|s| !s.end.flows()) {
-        out.push(
-            heading("Won't move until you act", Style::new().red()),
-            None,
-        );
-    }
-    for s in &v.stalls {
-        if s.end.flows() && !flowing_header {
-            flowing_header = true;
-            if !out.lines.is_empty() {
-                out.push(Line::raw(""), None);
-            }
-            out.push(
-                heading("Moving: waits clear on their own", Style::new().green()),
-                None,
-            );
-        }
-        let (mark, style) = end_style(&s.end);
-        let mut what = s.end.describe();
-        if let End::Moving(l) = &s.end
-            && l == RUNNING
-            && let Some(lock) = v.locks.iter().find(|l| l.issue.key() == s.at.key())
-        {
-            what = format!("{what} in slot {}, {}", lock.slot, ago(lock.started_at));
-        }
-        out.push(
-            Line::from(vec![
-                Span::styled(format!("{mark} "), style),
-                Span::styled(v.name(&s.at), Style::new().bold()),
-                "  ".into(),
-                Span::styled(s.title.clone(), dim()),
-            ]),
-            target(&s.at),
-        );
-        out.push(
-            Line::from(vec![
-                "  ".into(),
-                Span::styled(what, style),
-                Span::styled(format!("  · holds {}", s.held), Style::new().bold()),
-            ]),
-            None,
-        );
-        for l in &s.tree {
-            let mut spans = vec![
-                Span::styled(format!("  {}", l.guide), dim()),
-                Span::raw(format!("{} ", v.rel(&l.issue, &s.at))),
-            ];
-            let with: Vec<IssueRef> = l
-                .with
-                .iter()
-                .filter(|w| !l.also.iter().any(|a| a.key() == w.key()))
-                .cloned()
-                .collect();
-            if !with.is_empty() {
-                spans.push(Span::styled(
-                    format!("+{} ", v.names(&with, &s.at)),
-                    Style::new().fg(Color::Gray),
-                ));
-            }
-            if !l.also.is_empty() {
-                spans.push(Span::styled(
-                    format!("also held by {} ", v.names(&l.also, &s.at)),
-                    Style::new().yellow(),
-                ));
-            }
-            spans.push(Span::styled(l.title.clone(), dim()));
-            out.push(Line::from(spans), target(&l.issue));
-        }
-    }
+/// Something only you can move, with what to do about it.
+struct Ask {
+    tag: &'static str,
+    style: Style,
+    issue: IssueRef,
+    /// Ready issues that wait on it, directly or through others.
+    frees: usize,
+    since: Option<DateTime<Utc>>,
+    what: String,
+    window: Option<String>,
+}
 
-    let free: Vec<_> = v
+/// Everything waiting on you, most work freed first, then the oldest: a
+/// session asking you, a question on GitHub, a PR to review, a blocker that
+/// won't move on its own.
+fn asks(cfg: &Config, v: &View) -> Vec<Ask> {
+    let mut out: Vec<Ask> = Vec::new();
+    let frees = |r: &IssueRef| {
+        v.stalls
+            .iter()
+            .find(|s| s.at.key() == r.key())
+            .map_or(0, |s| s.held)
+    };
+    for l in &v.locks {
+        if let Some(w) = v.waiting_of(l) {
+            out.push(Ask {
+                tag: "reply",
+                style: Style::new().black().on_yellow().bold(),
+                issue: l.issue.clone(),
+                frees: frees(&l.issue),
+                since: Some(w.since),
+                what: "the session asks you; Enter goes to it".into(),
+                window: l.tmux_window.clone(),
+            });
+        }
+    }
+    let asking: BTreeSet<_> = out.iter().map(|a| a.issue.key()).collect();
+    let by_you = reviewed_by_you(cfg);
+    for n in v
         .status
-        .plan
-        .entries
+        .graph
         .iter()
-        .filter(|e| !graph::waits(&v.status.graph, &e.issue) || v.status.graph.is_empty())
-        .collect();
-    if !free.is_empty() {
-        if !out.lines.is_empty() {
-            out.push(Line::raw(""), None);
+        .filter(|n| n.state == IssueState::Open)
+    {
+        if asking.contains(&n.issue.key()) {
+            continue;
         }
-        out.push(heading("Ready, no open blocker", Style::new()), None);
-        for e in free {
-            let (tag, style, why) = match &e.verdict {
-                Verdict::Claim => ("claim", Style::new().green(), String::new()),
-                Verdict::Waiting(w) => ("wait ", Style::new().cyan(), w.clone()),
-                Verdict::Skipped(s) => ("skip ", Style::new().yellow(), s.clone()),
-            };
-            let mut spans = vec![
-                Span::styled(format!("{tag} "), style),
-                Span::styled(v.name(&e.issue), Style::new().bold()),
-                "  ".into(),
-                Span::styled(e.title.clone(), dim()),
-            ];
-            if !why.is_empty() {
-                spans.push(Span::styled(format!("  {why}"), style));
+        let since = || v.last_event(&n.issue);
+        if n.has(NEEDS_INPUT) {
+            let since = v
+                .last_event_of(&n.issue, |k| k == stats::Kind::ToYou)
+                .or_else(since);
+            out.push(Ask {
+                tag: "answer",
+                style: Style::new().yellow().bold(),
+                issue: n.issue.clone(),
+                frees: frees(&n.issue),
+                since,
+                what: String::new(),
+                window: None,
+            });
+        } else if n.has(REVIEW) && by_you(&n.issue) {
+            out.push(Ask {
+                tag: "review",
+                style: Style::new().magenta().bold(),
+                issue: n.issue.clone(),
+                frees: frees(&n.issue),
+                since: since(),
+                what: "CI is green: review and merge its PR".into(),
+                window: None,
+            });
+        }
+    }
+    for s in v.stalls.iter().filter(|s| !s.end.flows()) {
+        if matches!(s.end, End::NeedsInput) {
+            continue;
+        }
+        let held: Vec<IssueRef> = s
+            .tree
+            .iter()
+            .filter(|l| !l.guide.starts_with(' ') && !l.guide.starts_with('│'))
+            .map(|l| l.issue.clone())
+            .collect();
+        let held = v.names(&held, &s.at);
+        let what = match &s.end {
+            End::Unowned => {
+                "open without a dispatch label: label it dispatch:ready, or close it".into()
             }
-            out.push(Line::from(spans), target(&e.issue));
+            End::Dead => format!("closed as not planned: drop it from the blockers of {held}"),
+            End::Parked => "status:blocked: remove the label once it can go".into(),
+            End::Skipped(r) if r.starts_with("epic") => {
+                format!("an epic as blocker: point {held} at its sub-issues, or close it once done")
+            }
+            End::Skipped(r) => format!("skipped ({r})"),
+            End::Unresolvable(w) => {
+                format!("can't be looked up ({w}): fix the reference in {held}")
+            }
+            End::Cycle(m) => format!(
+                "deadlock: {} wait on each other; drop one dependency",
+                v.names(m, &s.at)
+            ),
+            End::NeedsInput | End::Moving(_) | End::Queued(_) => continue,
+        };
+        out.push(Ask {
+            tag: "unblock",
+            style: Style::new().red().bold(),
+            issue: s.at.clone(),
+            frees: s.held,
+            since: None,
+            what,
+            window: None,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.frees
+            .cmp(&a.frees)
+            .then(a.since.is_none().cmp(&b.since.is_none()))
+            .then(a.since.cmp(&b.since))
+            .then(a.issue.key().cmp(&b.issue.key()))
+    });
+    out
+}
+
+fn needs_you_rows(cfg: &Config, v: &View) -> Rows {
+    let mut out = Rows::default();
+    let asks = asks(cfg, v);
+    let w = asks
+        .iter()
+        .map(|a| v.name(&a.issue).chars().count().min(NAME_MAX))
+        .max()
+        .unwrap_or(0);
+    for a in asks {
+        let frees = match a.frees {
+            0 => String::new(),
+            n => format!("frees {n}"),
+        };
+        let since = a.since.map(ago).unwrap_or_else(|| "–".into());
+        let mut spans = vec![
+            Span::styled(format!("{:<8}", a.tag), a.style),
+            Span::styled(
+                format!("{:<w$} ", clip(&v.name(&a.issue), NAME_MAX)),
+                Style::new().bold(),
+            ),
+            Span::styled(format!("{frees:<9}"), Style::new().green().bold()),
+            Span::styled(format!("{since:>5}  "), dim()),
+        ];
+        if !a.what.is_empty() {
+            spans.push(Span::styled(format!("{}  ", a.what), Style::new().white()));
         }
+        spans.push(Span::styled(title_of(v, &a.issue), dim()));
+        out.push(
+            Line::from(spans),
+            Some(Target {
+                issue: a.issue,
+                window: a.window,
+            }),
+        );
     }
     if out.lines.is_empty() {
         out.push(
-            Line::styled("No ready issue waits on anything.", dim()),
+            Line::styled(
+                "Nothing waits on you. Blocker trees: issuewright status --tree",
+                dim(),
+            ),
             None,
         );
     }
@@ -1299,6 +1437,25 @@ hint: a continuation line
         assert_eq!(rows.step(3, -1), Some(1));
         assert_eq!(rows.step(1, 99), Some(4));
         assert_eq!(rows.step(4, -99), Some(1));
+    }
+
+    #[test]
+    fn clip_keeps_the_issue_number() {
+        assert_eq!(clip("mono#12", 22), "mono#12");
+        assert_eq!(
+            clip("terraform-provider-origincloud#51", 22),
+            "terraform-provider…#51"
+        );
+        assert_eq!(
+            clip("terraform-provider-origincloud#51", 22)
+                .chars()
+                .count(),
+            22
+        );
+        assert_eq!(
+            clip("terraform-provider-origincloud", 16),
+            "terraform-provi…"
+        );
     }
 
     #[test]
