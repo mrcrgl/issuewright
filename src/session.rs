@@ -146,13 +146,24 @@ pub struct RebaseVars<'a> {
     pub pr: &'a IssueRef,
     pub head_sha: &'a str,
     pub default_branch: &'a str,
+    /// Whether the PR was approved (`dispatch:merging`), rather than
+    /// waiting for CI that GitHub never ran because of the conflict.
+    pub approved: bool,
     pub dir: &'a Path,
     pub branch: &'a str,
     pub moved_from: Option<&'a Path>,
 }
 
 pub fn render_rebase_prompt(v: &RebaseVars) -> String {
+    let situation = if v.approved {
+        "{pr} was approved at `{head_sha}`, but it conflicts with `{default_branch}`, so it can't merge. \
+         issuewright turned its auto-merge off, so nothing merges before the rebased PR is reviewed again."
+    } else {
+        "{pr} at `{head_sha}` conflicts with `{default_branch}`. GitHub runs no CI on a pull request that \
+         can't merge, so it has no checks and can't be reviewed until it's rebased."
+    };
     REBASE_PROMPT
+        .replace("{situation}", situation)
         .replace("{mode}", &v.mode.to_string())
         .replace("{repo}", v.repo)
         .replace("{number}", &v.number.to_string())
@@ -1043,17 +1054,30 @@ deny = ["Bash(rm -rf *)"]
     #[test]
     fn rebase_prompt_renders_all_variables() {
         let pr = IssueRef::new("acme/app", 9);
-        let p = render_rebase_prompt(&RebaseVars {
-            mode: Mode::Unattended,
-            repo: "acme/app",
-            number: 7,
-            pr: &pr,
-            head_sha: "abc123",
-            default_branch: "main",
-            dir: Path::new("/slots/app/1"),
-            branch: "fix/7-x",
-            moved_from: None,
-        });
+        let render = |approved| {
+            render_rebase_prompt(&RebaseVars {
+                mode: Mode::Unattended,
+                repo: "acme/app",
+                number: 7,
+                pr: &pr,
+                head_sha: "abc123",
+                default_branch: "main",
+                approved,
+                dir: Path::new("/slots/app/1"),
+                branch: "fix/7-x",
+                moved_from: None,
+            })
+        };
+        let unreviewed = render(false);
+        assert!(
+            unreviewed.contains("acme/app#9 at `abc123` conflicts with `main`. GitHub runs no CI")
+        );
+        assert!(!unreviewed.contains("approved"));
+        assert!(
+            !unreviewed.contains('{'),
+            "unrendered variable in {unreviewed}"
+        );
+        let p = render(true);
         assert!(p.contains("acme/app#9 was approved at `abc123`, but it conflicts with `main`"));
         assert!(p.contains("`git rebase origin/main` outside the sandbox"));
         assert!(p.contains("gh issue edit 7 --repo acme/app --add-label dispatch:ci"));
