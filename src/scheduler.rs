@@ -4,7 +4,9 @@
 //! 2. Dependencies: runnable only when every blocker is done.
 //! 3. Epic precedence: sub-issues of started epics first, epics by priority,
 //!    then by start time; optional limit on started epics.
-//! 4. Order inside a group: the epic's sub-issue order, then priority, then age.
+//! 4. Order inside a group: the epic's sub-issue order, then priority, then age;
+//!    within the same priority (or the same epic), an issue that more ready
+//!    issues wait on, directly or through others, goes first.
 //! 5. Capacity: fill free slots from the top, per repo and globally, while
 //!    fewer of the repo's issues than `max_in_ci` wait for CI, unless new
 //!    sessions are on hold (resources) or the issue waits after failed starts.
@@ -68,6 +70,9 @@ pub struct Entry {
     pub title: String,
     pub epic: Option<IssueRef>,
     pub verdict: Verdict,
+    /// How many ready issues wait on this one, directly or through others.
+    #[serde(default)]
+    pub unlocks: usize,
 }
 
 /// A blocker that can't be resolved, so the dependent waits. issuewright comments
@@ -107,6 +112,7 @@ struct Cand<'a> {
     epic: Option<(String, u64)>,
     epic_index: usize,
     blocked: Option<String>,
+    unlocks: usize,
 }
 
 fn counts_as_started(s: &IssueStatus) -> bool {
@@ -206,6 +212,36 @@ fn blocker_reason(
     (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
+/// For each candidate, how many other candidates wait on it, directly or
+/// through others: what finishing it starts to free up.
+fn unlocks(cands: &[Cand]) -> BTreeMap<(String, u64), usize> {
+    let mut waiting_on: BTreeMap<(String, u64), Vec<(String, u64)>> = BTreeMap::new();
+    for c in cands {
+        for b in c.issue.blockers() {
+            waiting_on
+                .entry(b.key())
+                .or_default()
+                .push(c.issue.r().key());
+        }
+    }
+    cands
+        .iter()
+        .map(|c| {
+            let me = c.issue.r().key();
+            let mut seen = BTreeSet::new();
+            let mut todo = vec![me.clone()];
+            while let Some(k) = todo.pop() {
+                for d in waiting_on.get(&k).into_iter().flatten() {
+                    if *d != me && seen.insert(d.clone()) {
+                        todo.push(d.clone());
+                    }
+                }
+            }
+            (me, seen.len())
+        })
+        .collect()
+}
+
 pub fn schedule(snap: &Snapshot, policy: &Policy, cap: &Capacity, hist: &History) -> Plan {
     let mut plan = Plan::default();
     let mut epics = epic_infos(snap, hist);
@@ -245,6 +281,7 @@ pub fn schedule(snap: &Snapshot, policy: &Policy, cap: &Capacity, hist: &History
                 title: s.title.clone(),
                 epic: issue.parent.clone(),
                 verdict: Verdict::Skipped(reason),
+                unlocks: 0,
             });
             continue;
         }
@@ -263,7 +300,12 @@ pub fn schedule(snap: &Snapshot, policy: &Policy, cap: &Capacity, hist: &History
             epic,
             epic_index,
             blocked,
+            unlocks: 0,
         });
+    }
+    let unlocks = unlocks(&cands);
+    for c in &mut cands {
+        c.unlocks = unlocks[&c.issue.r().key()];
     }
 
     // 3. Epic precedence and 4. order inside a group.
@@ -271,6 +313,7 @@ pub fn schedule(snap: &Snapshot, policy: &Policy, cap: &Capacity, hist: &History
         let (x, y) = (&a.issue.status, &b.issue.status);
         x.priority()
             .cmp(&y.priority())
+            .then(b.unlocks.cmp(&a.unlocks))
             .then(x.created_at.cmp(&y.created_at))
             .then(x.r.cmp(&y.r))
     };
@@ -286,6 +329,7 @@ pub fn schedule(snap: &Snapshot, policy: &Policy, cap: &Capacity, hist: &History
             .cmp(&eb.priority)
             .then(ea.started_at.cmp(&eb.started_at))
             .then(ea.r.cmp(&eb.r))
+            .then(b.unlocks.cmp(&a.unlocks))
             .then(a.epic_index.cmp(&b.epic_index))
             .then_with(|| by_age(a, b))
     });
@@ -301,7 +345,12 @@ pub fn schedule(snap: &Snapshot, policy: &Policy, cap: &Capacity, hist: &History
     let mut rest: Vec<Option<Cand>> = rest.into_iter().map(Some).collect();
     for positions in slots_by_epic.values() {
         let mut group: Vec<Cand> = positions.iter().map(|&i| rest[i].take().unwrap()).collect();
-        group.sort_by(|a, b| a.epic_index.cmp(&b.epic_index).then_with(|| by_age(a, b)));
+        group.sort_by(|a, b| {
+            b.unlocks
+                .cmp(&a.unlocks)
+                .then(a.epic_index.cmp(&b.epic_index))
+                .then_with(|| by_age(a, b))
+        });
         for (&i, c) in positions.iter().zip(group) {
             rest[i] = Some(c);
         }
@@ -379,6 +428,7 @@ pub fn schedule(snap: &Snapshot, policy: &Policy, cap: &Capacity, hist: &History
             title: s.title.clone(),
             epic: c.epic.as_ref().map(|k| epics[k].r.clone()),
             verdict,
+            unlocks: c.unlocks,
         });
     }
 
@@ -587,6 +637,47 @@ mod tests {
             verdicts(&p)[0].1,
             Verdict::Waiting("waiting on web#5 (open, no merged PR)".into())
         );
+    }
+
+    #[test]
+    fn an_issue_others_wait_on_goes_first_within_its_priority() {
+        let mut snap = Snapshot::default();
+        // #1 is older, but #2 holds back #3, which holds back #4.
+        snap.issues.push(issue(MONO, 1, &[READY], 1));
+        snap.issues.push(issue(MONO, 2, &[READY], 2));
+        let mut c = issue(MONO, 3, &[READY], 3);
+        c.native_blockers.push(IssueRef::new(MONO, 2));
+        snap.issues.push(c);
+        let mut d = issue(MONO, 4, &[READY], 4);
+        d.body_blockers.push(IssueRef::new(MONO, 3));
+        snap.issues.push(d);
+        // A higher priority still goes before it.
+        snap.issues.push(issue(MONO, 5, &[READY, "priority:P1"], 5));
+        let p = run(&snap, &cap(1, 0));
+        let order: Vec<(u64, usize)> = p
+            .entries
+            .iter()
+            .map(|e| (e.issue.number, e.unlocks))
+            .collect();
+        assert_eq!(order, [(5, 0), (2, 2), (3, 1), (1, 0), (4, 0)]);
+        assert_eq!(claimed(&p), [5]);
+    }
+
+    #[test]
+    fn inside_an_epic_the_issue_others_wait_on_goes_first() {
+        let mut snap = Snapshot::default();
+        let subs: Vec<IssueStatus> = (11..=13).map(|n| st(MONO, n, &[READY], 1)).collect();
+        add_epic(&mut snap, MONO, 10, &[], subs);
+        for n in 11..=13 {
+            let mut i = issue(MONO, n, &[READY], 1);
+            i.parent = Some(IssueRef::new(MONO, 10));
+            if n == 13 {
+                i.native_blockers.push(IssueRef::new(MONO, 12));
+            }
+            snap.issues.push(i);
+        }
+        let p = run(&snap, &cap(1, 0));
+        assert_eq!(claimed(&p), [12]);
     }
 
     #[test]

@@ -816,15 +816,16 @@ fn pipeline_rows(v: &View) -> Rows {
 }
 
 fn end_style(e: &End) -> (&'static str, Style) {
-    match e {
-        End::Moving(_) => ("●", Style::new().green()),
-        End::Queued(_) => ("◌", Style::new().cyan()),
-        End::NeedsInput => ("?", Style::new().yellow().bold()),
-        End::Parked | End::Skipped(_) => ("‖", Style::new().yellow()),
+    let style = match e {
+        End::Moving(_) => Style::new().green(),
+        End::Queued(_) => Style::new().cyan(),
+        End::NeedsInput => Style::new().yellow().bold(),
+        End::Parked | End::Skipped(_) => Style::new().yellow(),
         End::Unowned | End::Dead | End::Unresolvable(_) | End::Cycle(_) => {
-            ("✖", Style::new().red().bold())
+            Style::new().red().bold()
         }
-    }
+    };
+    (e.mark(), style)
 }
 
 fn dependency_rows(v: &View) -> Rows {

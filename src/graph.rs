@@ -134,6 +134,17 @@ impl End {
         matches!(self, End::Moving(_) | End::Queued(_))
     }
 
+    /// A one-character sign for the kind of end.
+    pub fn mark(&self) -> &'static str {
+        match self {
+            End::Moving(_) => "●",
+            End::Queued(_) => "◌",
+            End::NeedsInput => "?",
+            End::Parked | End::Skipped(_) => "‖",
+            End::Unowned | End::Dead | End::Unresolvable(_) | End::Cycle(_) => "✖",
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             End::Moving(l) => l.clone(),
@@ -501,6 +512,7 @@ mod tests {
                 title: "t1".into(),
                 epic: None,
                 verdict: Verdict::Waiting("no free slot".into()),
+                unlocks: 0,
             }],
             ..Plan::default()
         };

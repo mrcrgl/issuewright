@@ -28,6 +28,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::config::{Config, default_config_path};
+use crate::model::IssueRef;
+use crate::scheduler::Verdict;
 use crate::state::{Kind, Mode, State};
 
 #[derive(Parser)]
@@ -57,7 +59,12 @@ enum Cmd {
         once: bool,
     },
     /// Slots, sessions, the queue with wait reasons, and the last poll.
-    Status,
+    Status {
+        /// Show the queue as trees of blockers: each issue that holds ready
+        /// issues back, with everything waiting on it underneath.
+        #[arg(long)]
+        tree: bool,
+    },
     /// Throughput and efficiency per day, from issuewright's log and the slots'
     /// transcripts.
     Stats {
@@ -160,7 +167,7 @@ fn main() -> Result<()> {
             )?
             .run()
         }
-        Cmd::Status => status(&cfg),
+        Cmd::Status { tree } => status(&cfg, tree),
         Cmd::Stats { days, no_tokens } => stats::print(&cfg, days, !no_tokens),
         Cmd::Watch => watch::run(&cfg),
         Cmd::Session { .. } | Cmd::SetupApp { .. } => unreachable!("handled above"),
@@ -179,6 +186,91 @@ fn main() -> Result<()> {
             };
             show_session(&cfg, &config_path, &repo, slot, write_settings, kind)
         }
+    }
+}
+
+/// The queue as trees of blockers, those that need you first, then the
+/// ready issues nothing holds back.
+fn print_trees(st: &state::Status, stalls: &[graph::Stall]) {
+    let mut moving_header = false;
+    if stalls.iter().any(|s| !s.end.flows()) {
+        println!("Won't move until you act:");
+    }
+    for s in stalls {
+        if s.end.flows() && !moving_header {
+            moving_header = true;
+            println!("\nMoving: these waits clear on their own:");
+        }
+        println!(
+            "{} {:<24} {}",
+            s.end.mark(),
+            s.at.short(),
+            truncate(&s.title, 60)
+        );
+        println!("    {} · holds {}", s.end.describe(), s.held);
+        for l in &s.tree {
+            let mut extra = String::new();
+            let with: Vec<String> = l
+                .with
+                .iter()
+                .filter(|w| !l.also.iter().any(|a| a.key() == w.key()))
+                .map(IssueRef::short)
+                .collect();
+            if !with.is_empty() {
+                extra.push_str(&format!(" +{}", with.join(", ")));
+            }
+            if !l.also.is_empty() {
+                let also: Vec<String> = l.also.iter().map(IssueRef::short).collect();
+                extra.push_str(&format!(" (also held by {})", also.join(", ")));
+            }
+            println!(
+                "    {}{}{extra}  {}",
+                l.guide,
+                l.issue.short(),
+                truncate(&l.title, 50)
+            );
+        }
+    }
+    let free: Vec<_> = st
+        .plan
+        .entries
+        .iter()
+        .filter(|e| !matches!(e.verdict, Verdict::Skipped(_)) && !graph::waits(&st.graph, &e.issue))
+        .collect();
+    if !free.is_empty() {
+        if !stalls.is_empty() {
+            println!();
+        }
+        println!("Ready, no open blocker (scheduled order):");
+        for e in free {
+            let (tag, why) = match &e.verdict {
+                Verdict::Claim => ("CLAIM", String::new()),
+                Verdict::Waiting(w) => ("wait ", format!("  {w}")),
+                Verdict::Skipped(_) => unreachable!(),
+            };
+            let unlocks = match e.unlocks {
+                0 => String::new(),
+                n => format!(" · unlocks {n}"),
+            };
+            println!(
+                "  {tag} {:<24} {}{unlocks}{why}",
+                e.issue.short(),
+                truncate(&e.title, 50)
+            );
+        }
+    } else if stalls.is_empty() {
+        println!("No {} issues.", model::READY);
+    }
+    for n in &st.plan.notes {
+        println!("note: {n}");
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n - 1).collect::<String>())
     }
 }
 
@@ -223,7 +315,7 @@ fn show_session(
     Ok(())
 }
 
-fn status(cfg: &Config) -> Result<()> {
+fn status(cfg: &Config, tree: bool) -> Result<()> {
     let state = State::open(cfg.state_dir())?;
     let st = state.status()?;
     let locks = state.locks()?;
@@ -288,13 +380,15 @@ fn status(cfg: &Config) -> Result<()> {
         }
     }
     println!();
+    let stalls = graph::analyze(&st.graph, &st.plan);
+    if tree {
+        print_trees(&st, &stalls);
+        return Ok(());
+    }
     daemon::print_plan(&st.plan, &[]);
-    let stuck: Vec<_> = graph::analyze(&st.graph, &st.plan)
-        .into_iter()
-        .filter(|s| !s.end.flows())
-        .collect();
+    let stuck: Vec<_> = stalls.into_iter().filter(|s| !s.end.flows()).collect();
     if !stuck.is_empty() {
-        println!("\nStuck until you act (issuewright watch shows the full trees):");
+        println!("\nStuck until you act (issuewright status --tree shows the full trees):");
         for s in stuck {
             println!(
                 "  {:<24} holds {}: {}",
