@@ -60,6 +60,37 @@ fn git(dir: &Path, token: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// How often a write of the shared `.git/config` is retried while another
+/// git process holds `config.lock`, waiting 100 ms, then twice as long each
+/// time (about six seconds in all). Sessions in the repository's other slots
+/// run git against the same config, and git holds the lock for
+/// milliseconds, so a claim that writes it at that moment would fail.
+const CONFIG_LOCK_RETRIES: u32 = 6;
+
+/// [`git`] for a command that writes the shared `.git/config`: retried while
+/// the config is locked, clearing the locks that are known to be stale
+/// before each retry.
+fn git_writing_config(slot: &Slot, dir: &Path, token: &str, args: &[&str]) -> Result<String> {
+    let mut wait = std::time::Duration::from_millis(100);
+    let mut attempt = 0;
+    loop {
+        match git(dir, token, args) {
+            Err(e) if attempt < CONFIG_LOCK_RETRIES && config_locked(&e) => {
+                std::thread::sleep(wait);
+                wait *= 2;
+                attempt += 1;
+                clear_stale_locks(slot)?;
+            }
+            res => return res,
+        }
+    }
+}
+
+/// Whether git failed because another process held `.git/config`'s lock.
+fn config_locked(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("could not lock config file")
+}
+
 /// Creates the base clone and the slot's worktree when missing.
 pub fn ensure(slot: &Slot, repo: &RepoConfig, token: &str) -> Result<()> {
     if !slot.base.join(".git").exists() {
@@ -71,13 +102,14 @@ pub fn ensure(slot: &Slot, repo: &RepoConfig, token: &str) -> Result<()> {
     let base = &slot.base;
     clear_stale_locks(slot)?;
     set_config(
+        slot,
         base,
         token,
         "commit.gpgsign",
         if repo.sign_commits { "true" } else { "false" },
     )?;
     // `git push` without arguments pushes the current branch to its namesake.
-    set_config(base, token, "push.default", "current")?;
+    set_config(slot, base, token, "push.default", "current")?;
     if !slot.dir.join(".git").exists() {
         git(base, token, &["fetch", "--prune", "origin"])?;
         let dir = slot.dir.to_string_lossy().into_owned();
@@ -148,10 +180,20 @@ pub fn reset(slot: &Slot, branch: &str, token: &str) -> Result<Reset> {
     git(dir, token, &["reset", "--hard"])?;
     git(dir, token, &["clean", "-fdx", "-e", "target/"])?;
     release_branch(slot, branch, token)?;
-    git(
+    // `--no-track`: `set_upstream` below sets the tracking, and writes the
+    // shared config only when it changes.
+    git_writing_config(
+        slot,
         dir,
         token,
-        &["switch", "--discard-changes", "-C", branch, &start],
+        &[
+            "switch",
+            "--discard-changes",
+            "--no-track",
+            "-C",
+            branch,
+            &start,
+        ],
     )?;
     // Track the same-named remote branch, even before it exists. `switch -C`
     // from the default branch would track `origin/<default>`, and a session
@@ -299,8 +341,15 @@ pub fn unmerged_branch(
 /// Points `branch` at `origin/<branch>` for push and pull.
 fn set_upstream(slot: &Slot, branch: &str, token: &str) -> Result<()> {
     let dir = &slot.dir;
-    set_config(dir, token, &format!("branch.{branch}.remote"), "origin")?;
     set_config(
+        slot,
+        dir,
+        token,
+        &format!("branch.{branch}.remote"),
+        "origin",
+    )?;
+    set_config(
+        slot,
         dir,
         token,
         &format!("branch.{branch}.merge"),
@@ -310,11 +359,11 @@ fn set_upstream(slot: &Slot, branch: &str, token: &str) -> Result<()> {
 
 /// Sets a git config value unless it already has it, so a claim writes the
 /// shared `.git/config` only when something changes.
-fn set_config(dir: &Path, token: &str, key: &str, value: &str) -> Result<()> {
+fn set_config(slot: &Slot, dir: &Path, token: &str, key: &str, value: &str) -> Result<()> {
     if git(dir, token, &["config", "--get", key]).is_ok_and(|v| v == value) {
         return Ok(());
     }
-    git(dir, token, &["config", key, value])?;
+    git_writing_config(slot, dir, token, &["config", key, value])?;
     Ok(())
 }
 
@@ -554,6 +603,25 @@ mod tests {
             ["refs/heads/feat/1-x", "refs/heads/main"]
         );
         assert_eq!(sh(&remote, &["rev-list", "--count", "main"]), "1");
+
+        // Another slot's git holds the config lock for a moment: the claim
+        // waits for it instead of failing.
+        let held = slot.git_common_dir().join("config.lock");
+        std::fs::write(&held, "[core]\n").unwrap();
+        let release = {
+            let held = held.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::remove_file(held).unwrap();
+            })
+        };
+        let r = reset(&slot, "feat/2-y", "").unwrap();
+        release.join().unwrap();
+        assert!(!r.continued);
+        assert_eq!(
+            sh(&slot.dir, &["config", "branch.feat/2-y.merge"]),
+            "refs/heads/feat/2-y"
+        );
 
         // A sandbox placeholder lock doesn't block the next claim.
         let lock = slot.git_common_dir().join("config.lock");
