@@ -409,7 +409,15 @@ Run each as a command of its own: no `cd`, no `&&` or pipes, no redirects, or th
 - `{exe} session rebase`: fetch and rebase this branch onto the default branch. Use it instead of `git rebase`, which fails in the sandbox once the default branch changed files under `.claude/`. At a conflict it stops: resolve, `git add` the files, then `{exe} session continue`; or `{exe} session abort`.\n\
 - `{exe} session reset`: discard every uncommitted change, untracked files too, and abort a rebase in progress. For a worktree a failed git command left half changed.\n\
 - `{exe} session rerun-ci <run-id>`: re-run the failed jobs of a finished CI run of this branch, when the failure isn't caused by this branch (a runner that ran out of disk, a flaky test, a check that also fails on the default branch). Say on the issue why you re-ran it. It refuses runs of other branches, and after three attempts.\n\
-Push yourself afterwards, as a command of its own: `git push --force-with-lease` after a rebase."
+Push yourself afterwards, as a command of its own: `git push --force-with-lease` after a rebase.\n\n\
+Creating issues is part of your work, in this repository and in others: a follow-up you found, or work another \
+repository owns, such as the console or SDK change an API change of yours calls for. Before you create one, check \
+that no open issue covers it already (`gh issue list --repo <owner/name> --search <words>`), and use only labels that \
+exist in that repository (`gh label list --repo <owner/name>`). Write the body to a file with your file tool, then \
+run `gh issue create --repo <owner/name> --title <title> --label <label> --body-file <its absolute path>` as a command \
+of its own: no heredoc, `cd`, `&&`, `;` or pipes. That form is allowed outright; any other form is judged case by \
+case, and refused at times. In the body, name the issue or PR it comes from (`owner/name#123` across repositories), \
+then link the new issue on this issue in a comment."
     )
 }
 
@@ -417,6 +425,14 @@ Push yourself afterwards, as a command of its own: `git push --force-with-lease`
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn creating_issues_uses_the_allowed_form() {
+        let p = system_prompt("/bin/issuewright");
+        assert!(p.contains("`gh issue create --repo <owner/name>"));
+        assert!(p.contains("--body-file <its absolute path>"));
+        assert!(p.contains("no heredoc"));
+    }
 
     fn rec(dir: &Path, repo: &str, slot: usize, key: &str) -> Record {
         let r = Record {
