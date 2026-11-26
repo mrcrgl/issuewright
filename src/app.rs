@@ -169,6 +169,19 @@ fn read_key_file(p: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// jsonwebtoken 12 panics at the first signature unless exactly one
+    /// crypto backend feature is enabled.
+    #[test]
+    fn jsonwebtoken_has_a_crypto_backend() {
+        let claims = Claims {
+            iat: 0,
+            exp: 1,
+            iss: "1".into(),
+        };
+        let key = EncodingKey::from_secret(b"test").unwrap();
+        assert!(jsonwebtoken::encode(&Header::new(Algorithm::HS256), &claims, &key).is_ok());
+    }
+
     #[test]
     fn needs_exactly_one_key_source() {
         let both = ReviewAppConfig {
