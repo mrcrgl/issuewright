@@ -2619,8 +2619,12 @@ pub fn print_plan(plan: &Plan, locks: &[SlotLock]) {
                 .as_ref()
                 .map(|r| format!(" [epic {}]", r.short()))
                 .unwrap_or_default();
+            let unlocks = match e.unlocks {
+                0 => String::new(),
+                n => format!(" · unlocks {n}"),
+            };
             println!(
-                "  {tag} {:<24} {}{epic}",
+                "  {tag} {:<24} {}{epic}{unlocks}",
                 e.issue.short(),
                 truncate(&e.title, 60)
             );

@@ -118,10 +118,10 @@ flowchart TD
     C3 -- "no" --> C4{"Every blocker done?<br/>native blocked-by, and the<br/>Dependencies / Blockers section"}
     C4 -- "no, or unresolvable" --> WT(["Waits"])
     C4 -- "yes" --> C5{"Its epic started?"}
-    C5 -- "yes" --> G1["Group 1, first:<br/>epic priority, epic start,<br/>sub-issue order, priority, age"]
+    C5 -- "yes" --> G1["Group 1, first:<br/>epic priority, epic start,<br/>issues waiting on it, sub-issue order,<br/>priority, age"]
     C5 -- "no" --> C6{"max_started_epics reached?"}
     C6 -- "yes, and it has an epic" --> WT
-    C6 -- "no, or no epic" --> G2["Group 2:<br/>priority P0..P4 (none = last), age;<br/>an epic's sub-issues in the epic's order"]
+    C6 -- "no, or no epic" --> G2["Group 2:<br/>priority P0..P4 (none = last),<br/>issues waiting on it, age;<br/>an epic's sub-issues by issues<br/>waiting on them, then the epic's order"]
     G1 --> C7{"Free slot in its repo<br/>and under max_sessions?"}
     G2 --> C7
     C7 -- "no" --> WT
