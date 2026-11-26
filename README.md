@@ -70,13 +70,14 @@ Sub-issues of one epic with no declared dependency between them may run in paral
 
 `issuewright watch` is a screen to keep open beside the daemon. It reads what the daemon writes (`status.json`, the slot locks, the log) and the slots' transcripts, asks tmux which windows are alive, calls no GitHub API and changes nothing. It shows:
 
-- the last poll, slots in use, issues waiting, sessions asking you, stuck chains;
+- the tabs (`Live`, `Stats`), the last poll, slots in use and sessions asking you;
+- the ready work by what it waits on: **qualified** (nothing in its way, it starts as slots free up), **behind work in flight** (it waits only on blockers that move on their own), and their sum, the work that gets done **without you**. Then what's **held** by stuck chains, the issues that **need you** (`dispatch:needs-input`), the ones **parked** with `status:blocked`, and those **in flight** (running, in CI, in review, merging);
 - today's numbers from the log: sessions started, PRs handed to CI, CI failures, approvals, closed issues, and handbacks to you. Next to them is a sparkline of busy slots over the last day, one character per half hour;
 - **1 Sessions:** the slots and their sessions. A session waiting for your answer shows "asks you" with how long, and when issuewright will move its question to GitHub;
 - **2 Pipeline:** the issues further down the pipeline (`needs-input`, `running`, `ci`, `review`, `changes-requested`, `approved`, `merging`);
 - **3 Blockers:** a tree of blockers for each ready issue that waits on one;
 - **Events:** the last lines of issuewright's log, in local time;
-- **4 Stats**, a tab of its own: the numbers of [`issuewright stats`](#throughput-and-efficiency) for every day, with bars of sessions started, approvals and CI failures per day.
+- **4 Stats**, a tab of its own: the two tables of [`issuewright stats`](#throughput-and-efficiency) for every day, what got done and how long it took, what it cost and what was left, with bars of sessions started, approvals and CI failures per day.
 
 Each tree starts at the issue a chain of blockers ends at and lists the issues waiting on it, directly or through others. `+#12` names an issue's other open blockers, and "also held by" names other ends it waits on. The trees whose end won't move until you act come first, in red:
 
@@ -105,18 +106,20 @@ Keys:
 
 ### Throughput and efficiency
 
-`issuewright stats [--days 14] [--no-tokens]` prints one row per day and a summary, counted from issuewright's log and the slots' transcripts:
+`issuewright stats [--days 14] [--no-tokens]` prints two tables with one row per day, and a summary. They're counted from issuewright's log, the slots' transcripts and the backlog issuewright records at each poll:
 
 | Column | Counts |
 |---|---|
 | started, reviews | implementing and reviewer sessions started |
 | to CI, CI red, rebase | PRs handed to CI, CI failures issuewright resumed a session for, conflicts it resumed one to rebase |
+| closed | issues closed while their session ran, by a merge or by hand |
 | approved, changes | review verdicts |
 | to you | issues handed back with `dispatch:needs-input` |
 | errors | things issuewright tried that failed (claims, CI checks, merges) |
 | lead p50 | median from an issue's first claim to its approval |
 | CI p50 | median from handing a PR to CI to its result, queue included |
-| output, out/approved | model output tokens of the slots' sessions, and per approval |
+| read, output, out/approved | model tokens of the slots' sessions: everything read (input and cache), the output, and output per approval |
+| qualified … in flight | the backlog at the day's last poll, as in `issuewright watch`. issuewright keeps it in `backlog.json` in its state directory, one sample an hour for 90 days; days before it recorded any show `–` |
 
 The summary adds p90s, the share of PRs with a red CI round, the share of implementing sessions (fresh or resumed) that ended with you, and output tokens per approval. Each model turn counts once, even when issuewright copied its transcript to resume it in another slot. Reading all transcripts takes a few seconds; `--no-tokens` skips it. Neither the command nor the tab calls GitHub, so the time from approval to merge isn't included.
 

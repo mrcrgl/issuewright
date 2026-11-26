@@ -130,6 +130,33 @@ pub struct Usage {
     pub busy: usize,
 }
 
+/// The backlog at one poll, the last of each hour.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BacklogSample {
+    pub at: DateTime<Utc>,
+    #[serde(flatten)]
+    pub counts: crate::graph::Backlog,
+}
+
+/// How long the backlog's history goes back.
+const BACKLOG_DAYS: i64 = 90;
+
+/// Adds `counts` at `now` to `history`, replacing the sample of the same
+/// hour, and drops samples older than [`BACKLOG_DAYS`].
+pub fn add_backlog(
+    history: &mut Vec<BacklogSample>,
+    now: DateTime<Utc>,
+    counts: crate::graph::Backlog,
+) {
+    let hour = |t: DateTime<Utc>| t.timestamp().div_euclid(3600);
+    match history.last_mut() {
+        Some(s) if hour(s.at) == hour(now) => *s = BacklogSample { at: now, counts },
+        _ => history.push(BacklogSample { at: now, counts }),
+    }
+    let since = now - chrono::Duration::days(BACKLOG_DAYS);
+    history.retain(|s| s.at > since);
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CiSeen {
     pub head_sha: String,
@@ -310,6 +337,16 @@ impl State {
     pub fn save_status(&self, s: &Status) -> Result<()> {
         write_json(&self.dir.join("status.json"), s)
     }
+
+    /// The backlog at each hour of the last [`BACKLOG_DAYS`] days, oldest first.
+    pub fn backlog(&self) -> Result<Vec<BacklogSample>> {
+        read_json(&self.dir.join("backlog.json"))
+    }
+    pub fn record_backlog(&self, now: DateTime<Utc>, counts: crate::graph::Backlog) -> Result<()> {
+        let mut h = self.backlog()?;
+        add_backlog(&mut h, now, counts);
+        write_json(&self.dir.join("backlog.json"), &h)
+    }
 }
 
 #[cfg(test)]
@@ -327,5 +364,23 @@ mod tests {
         assert_eq!(st.usage.iter().map(|u| u.busy).collect::<Vec<_>>(), [3, 0]);
         st.record_usage(t("2026-11-23T10:05:00Z"), 1);
         assert_eq!(st.usage.iter().map(|u| u.busy).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn backlog_keeps_the_last_sample_of_each_hour() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let b = |q| crate::graph::Backlog {
+            qualified: q,
+            ..Default::default()
+        };
+        let mut h = Vec::new();
+        add_backlog(&mut h, t("2026-08-01T10:00:00Z"), b(9));
+        add_backlog(&mut h, t("2026-11-22T10:05:00Z"), b(1));
+        add_backlog(&mut h, t("2026-11-22T10:50:00Z"), b(2));
+        add_backlog(&mut h, t("2026-11-22T11:01:00Z"), b(3));
+        let q: Vec<usize> = h.iter().map(|s| s.counts.qualified).collect();
+        assert_eq!(q, [2, 3]);
+        let json = serde_json::to_string(&h[0]).unwrap();
+        assert!(json.contains(r#""qualified":2"#), "{json}");
     }
 }

@@ -15,6 +15,8 @@ use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::graph::Backlog;
+use crate::state::{BacklogSample, State};
 
 /// What one log line says happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +111,8 @@ pub struct Day {
     /// From handing a PR to CI to its result, for results this day.
     pub ci_minutes: Vec<i64>,
     pub tokens: Tokens,
+    /// The backlog at the day's last poll, once issuewright recorded it.
+    pub backlog: Option<Backlog>,
 }
 
 impl Day {
@@ -120,7 +124,8 @@ impl Day {
     }
     /// Output tokens per approved PR.
     pub fn output_per_approval(&self) -> Option<u64> {
-        (self.approved > 0).then(|| self.tokens.output / self.approved as u64)
+        (self.approved > 0 && self.tokens.output > 0)
+            .then(|| self.tokens.output / self.approved as u64)
     }
 }
 
@@ -143,6 +148,11 @@ pub struct Tokens {
 }
 
 impl Tokens {
+    /// Everything the model read: fresh input and the cache, written or read.
+    pub fn read(&self) -> u64 {
+        self.input + self.cache_write + self.cache_read
+    }
+
     fn add(&mut self, o: &Tokens) {
         self.input += o.input;
         self.cache_write += o.cache_write;
@@ -221,6 +231,16 @@ pub fn add_tokens(days: &mut [Day], tokens: &BTreeMap<NaiveDate, Tokens>) {
         if let Some(t) = tokens.get(&d.date) {
             d.tokens.add(t);
         }
+    }
+}
+
+/// Gives each day the backlog of its last sample, in local time.
+pub fn add_backlog(days: &mut [Day], history: &[BacklogSample]) {
+    for d in days {
+        d.backlog = history
+            .iter()
+            .rfind(|s| s.at.with_timezone(&Local).date_naive() == d.date)
+            .map(|s| s.counts);
     }
 }
 
@@ -375,53 +395,86 @@ pub fn duration(mins: i64) -> String {
     }
 }
 
-/// The table `issuewright stats` prints and the Stats tab shows: a header and one
-/// row per day, newest first.
-pub fn table(days: &[Day]) -> (Vec<&'static str>, Vec<Vec<String>>) {
-    let header = vec![
-        "day",
-        "started",
-        "reviews",
-        "to CI",
-        "CI red",
-        "rebase",
-        "approved",
-        "changes",
-        "to you",
-        "errors",
-        "lead p50",
-        "CI p50",
-        "output",
-        "out/approved",
-    ];
+/// A table: its header and one row per day, newest first.
+pub type Table = (Vec<&'static str>, Vec<Vec<String>>);
+
+/// The tables `issuewright stats` prints and the Stats tab shows: what got
+/// done, and how long it took, what it cost and what was left.
+pub fn tables(days: &[Day]) -> [Table; 2] {
     let opt = |o: Option<String>| o.unwrap_or_else(|| "–".into());
-    let rows = days
-        .iter()
-        .rev()
-        .map(|d| {
-            vec![
-                d.date.format("%a %m-%d").to_string(),
-                d.claimed.to_string(),
-                d.reviews.to_string(),
-                d.to_ci.to_string(),
-                d.ci_red.to_string(),
-                d.conflicts.to_string(),
-                d.approved.to_string(),
-                d.changes_requested.to_string(),
-                d.to_you.to_string(),
-                d.errors.to_string(),
-                opt(d.lead_p50().map(duration)),
-                opt(d.ci_p50().map(duration)),
-                if d.tokens.output > 0 {
-                    human(d.tokens.output)
-                } else {
-                    "–".into()
-                },
-                opt(d.output_per_approval().map(human)),
-            ]
-        })
-        .collect();
-    (header, rows)
+    let day = |d: &Day| d.date.format("%a %m-%d").to_string();
+    let work = (
+        vec![
+            "day", "started", "reviews", "to CI", "CI red", "rebase", "changes", "approved",
+            "closed", "to you", "errors",
+        ],
+        days.iter()
+            .rev()
+            .map(|d| {
+                let mut r = vec![day(d)];
+                r.extend(
+                    [
+                        d.claimed,
+                        d.reviews,
+                        d.to_ci,
+                        d.ci_red,
+                        d.conflicts,
+                        d.changes_requested,
+                        d.approved,
+                        d.closed,
+                        d.to_you,
+                        d.errors,
+                    ]
+                    .map(|n| n.to_string()),
+                );
+                r
+            })
+            .collect(),
+    );
+    let tokens = |n: u64| if n > 0 { human(n) } else { "–".into() };
+    let flow = (
+        vec![
+            "day",
+            "lead p50",
+            "CI p50",
+            "read",
+            "output",
+            "out/approved",
+            "qualified",
+            "behind",
+            "held",
+            "needs you",
+            "parked",
+            "in flight",
+        ],
+        days.iter()
+            .rev()
+            .map(|d| {
+                let mut r = vec![
+                    day(d),
+                    opt(d.lead_p50().map(duration)),
+                    opt(d.ci_p50().map(duration)),
+                    tokens(d.tokens.read()),
+                    tokens(d.tokens.output),
+                    opt(d.output_per_approval().map(human)),
+                ];
+                r.extend(match d.backlog {
+                    Some(b) => [
+                        b.qualified,
+                        b.behind_moving,
+                        b.held,
+                        b.needs_input,
+                        b.parked,
+                        b.in_flight,
+                    ]
+                    .map(|n| n.to_string()),
+                    None => std::array::from_fn(|_| "–".to_string()),
+                });
+                r
+            })
+            .collect(),
+    );
+    [work, flow]
 }
 
 /// Totals over `days`: approvals, median lead time, CI red rounds per PR
@@ -473,21 +526,7 @@ pub fn summary(days: &[Day]) -> String {
     )
 }
 
-/// `issuewright stats`: the last `days` days.
-pub fn print(cfg: &Config, n: usize, tokens: bool) -> Result<()> {
-    let today = Local::now().date_naive();
-    let mut all = days(&read_log(cfg), today);
-    if tokens {
-        let mut scan = TokenScan::default();
-        scan.update(cfg);
-        add_tokens(&mut all, &scan.by_day);
-    }
-    let last = &all[all.len().saturating_sub(n)..];
-    if last.is_empty() {
-        println!("No events in issuewright's log yet.");
-        return Ok(());
-    }
-    let (header, rows) = table(last);
+fn print_table(header: &[&str], rows: Vec<Vec<String>>) {
     let width = |i: usize| {
         rows.iter()
             .map(|r| r[i].chars().count())
@@ -514,10 +553,37 @@ pub fn print(cfg: &Config, n: usize, tokens: bool) -> Result<()> {
     for r in rows {
         println!("{}", line(r));
     }
+}
+
+/// `issuewright stats`: the last `days` days.
+pub fn print(cfg: &Config, n: usize, tokens: bool) -> Result<()> {
+    let today = Local::now().date_naive();
+    let mut all = days(&read_log(cfg), today);
+    if let Ok(h) = State::open(cfg.state_dir()).and_then(|s| s.backlog()) {
+        add_backlog(&mut all, &h);
+    }
+    if tokens {
+        let mut scan = TokenScan::default();
+        scan.update(cfg);
+        add_tokens(&mut all, &scan.by_day);
+    }
+    let last = &all[all.len().saturating_sub(n)..];
+    if last.is_empty() {
+        println!("No events in issuewright's log yet.");
+        return Ok(());
+    }
+    for (i, (header, rows)) in tables(last).into_iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        print_table(&header, rows);
+    }
     println!("\n{}", summary(last));
     println!(
-        "\nlead: first claim to approval. CI: handed to CI to green or red, queue included. output: model output \
-         tokens of the slots' sessions{}.",
+        "\nlead: first claim to approval. CI: handed to CI to green or red, queue included. read, output: model \
+         tokens of the slots' sessions{}.\nBacklog at the day's last poll: qualified (ready, nothing in the way), \
+         behind (waits only on work in flight), held (waits on something only you can move), needs you \
+         (dispatch:needs-input), parked (status:blocked), in flight (running, CI, review, merging).",
         if tokens {
             ""
         } else {
@@ -530,6 +596,7 @@ pub fn print(cfg: &Config, n: usize, tokens: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     const LOG: &str = "\
 2026-11-22T08:00:00Z app#1: claimed, slot 1, window @1, branch feat/1-x
@@ -591,7 +658,41 @@ mod tests {
         let d = days(&lines, first + chrono::Days::new(2));
         assert_eq!(d.len(), 3);
         assert_eq!(d[2].claimed, 0);
-        assert_eq!(table(&d).1.len(), 3);
+        let [work, flow] = tables(&d);
+        assert_eq!((work.1.len(), flow.1.len()), (3, 3));
+        assert_eq!(flow.1[0].len(), flow.0.len());
+        // No backlog recorded and no tokens: dashes, not zeros.
+        assert_eq!(flow.1[0][5..], ["–"; 7]);
+    }
+
+    #[test]
+    fn a_day_takes_the_backlog_of_its_last_sample() {
+        let at = |h: u32| {
+            Local
+                .with_ymd_and_hms(2026, 11, 22, h, 0, 0)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let sample = |h, q| BacklogSample {
+            at: at(h),
+            counts: Backlog {
+                qualified: q,
+                ..Default::default()
+            },
+        };
+        let mut d = vec![
+            Day {
+                date: at(12).with_timezone(&Local).date_naive(),
+                ..Default::default()
+            },
+            Day {
+                date: at(12).with_timezone(&Local).date_naive() + chrono::Days::new(1),
+                ..Default::default()
+            },
+        ];
+        add_backlog(&mut d, &[sample(9, 4), sample(20, 7)]);
+        assert_eq!(d[0].backlog.map(|b| b.qualified), Some(7));
+        assert_eq!(d[1].backlog, None);
     }
 
     #[test]

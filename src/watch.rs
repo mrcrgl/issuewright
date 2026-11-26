@@ -524,6 +524,7 @@ fn header_lines(cfg: &Config, v: &View, slots: usize) -> Vec<Line<'static>> {
         Span::styled("issuewright", Style::new().bold()),
         "  ".into(),
     ];
+    spans.extend(tabs(false));
     match v.status.last_poll {
         Some(t) => {
             let late = (Utc::now() - t).num_seconds() > (cfg.poll_interval_secs * 3 + 30) as i64;
@@ -545,16 +546,8 @@ fn header_lines(cfg: &Config, v: &View, slots: usize) -> Vec<Line<'static>> {
         }
         None => spans.push(Span::styled("never polled", Style::new().red())),
     }
-    let waiting = v
-        .status
-        .plan
-        .entries
-        .iter()
-        .filter(|e| matches!(e.verdict, Verdict::Waiting(_)))
-        .count();
-    let stuck = v.stalls.iter().filter(|s| !s.end.flows()).count();
     let asking = v.waiting.len();
-    spans.push(format!("  ·  {}/{slots} slots  ·  {waiting} waiting", v.locks.len()).into());
+    spans.push(format!("  ·  {}/{slots} slots", v.locks.len()).into());
     if asking > 0 {
         spans.push("  ·  ".into());
         spans.push(Span::styled(
@@ -562,15 +555,9 @@ fn header_lines(cfg: &Config, v: &View, slots: usize) -> Vec<Line<'static>> {
             Style::new().yellow().bold(),
         ));
     }
-    if stuck > 0 {
-        spans.push("  ·  ".into());
-        spans.push(Span::styled(
-            format!("{stuck} stuck"),
-            Style::new().red().bold(),
-        ));
-    }
     let mut out = vec![
         Line::from(spans),
+        backlog_line(v),
         today_line(v, cfg.max_sessions.min(slots)),
     ];
     if let Some(e) = v.error.as_ref().or(v.status.last_error.as_ref()) {
@@ -586,6 +573,46 @@ fn header_lines(cfg: &Config, v: &View, slots: usize) -> Vec<Line<'static>> {
         ));
     }
     out
+}
+
+/// The ready work by what it waits on: how much gets done without you.
+fn backlog_line(v: &View) -> Line<'static> {
+    let b = graph::backlog(&v.status.graph, &v.status.plan);
+    let stuck = v.stalls.iter().filter(|s| !s.end.flows()).count();
+    let n = |k: usize, what: String, style: Style| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(k.to_string(), if k > 0 { style } else { dim() }),
+            Span::styled(format!(" {what}  "), dim()),
+        ]
+    };
+    let mut spans = vec![Span::styled("ready  ", dim())];
+    spans.extend(n(
+        b.qualified,
+        "qualified".into(),
+        Style::new().green().bold(),
+    ));
+    spans.extend(n(
+        b.behind_moving,
+        "behind work in flight".into(),
+        Style::new().green(),
+    ));
+    spans.push(Span::styled("= ", dim()));
+    spans.extend(n(
+        b.unattended(),
+        "without you".into(),
+        Style::new().green().bold(),
+    ));
+    spans.push(Span::styled("·  ", dim()));
+    let held = if stuck > 0 {
+        format!("held by {stuck} stuck")
+    } else {
+        "held".into()
+    };
+    spans.extend(n(b.held, held, Style::new().red().bold()));
+    spans.extend(n(b.needs_input, "need you".into(), Style::new().yellow()));
+    spans.extend(n(b.parked, "parked".into(), Style::new().yellow()));
+    spans.extend(n(b.in_flight, "in flight".into(), Style::new().cyan()));
+    Line::from(spans)
 }
 
 /// What happened today, counted from issuewright's log.
@@ -1033,6 +1060,9 @@ impl StatsTab {
             return;
         }
         let mut days = stats::days(&stats::read_log(cfg), Local::now().date_naive());
+        if let Ok(h) = crate::state::State::open(cfg.state_dir()).and_then(|s| s.backlog()) {
+            stats::add_backlog(&mut days, &h);
+        }
         if let Some(t) = &tokens {
             stats::add_tokens(&mut days, t);
         }
@@ -1045,6 +1075,56 @@ impl StatsTab {
             .as_ref()
             .is_some_and(|t| t.lock().map(|t| t.is_none()).unwrap_or(false))
     }
+}
+
+fn stats_table(
+    header: Vec<&'static str>,
+    rows: Vec<Vec<String>>,
+    title: &'static str,
+) -> Table<'static> {
+    let widths: Vec<Constraint> = header
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let w = rows
+                .iter()
+                .map(|r| r[i].chars().count())
+                .chain([h.chars().count()])
+                .max()
+                .unwrap_or(1);
+            Constraint::Length(w as u16)
+        })
+        .collect();
+    let right = |i: usize, c: String| {
+        if i == 0 {
+            Line::from(c)
+        } else {
+            Line::from(c).right_aligned()
+        }
+    };
+    let row =
+        |cells: Vec<String>| Row::new(cells.into_iter().enumerate().map(|(i, c)| right(i, c)));
+    Table::new(rows.into_iter().map(row).collect::<Vec<_>>(), widths)
+        .header(row(header.iter().map(|h| h.to_string()).collect()).style(Style::new().bold()))
+        .column_spacing(2)
+        .block(Block::bordered().title(title).border_style(dim()))
+}
+
+/// The tab bar: the live panes or the Stats tab.
+fn tabs(stats: bool) -> Vec<Span<'static>> {
+    let tab = |name: &'static str, on: bool| {
+        if on {
+            Span::styled(name, Style::new().black().on_cyan().bold())
+        } else {
+            Span::styled(name, dim())
+        }
+    };
+    vec![
+        tab(" Live 1-3 ", !stats),
+        " ".into(),
+        tab(" Stats 4 ", stats),
+        "  ".into(),
+    ]
 }
 
 /// Days the chart shows: as many as fit, at most the last 30.
@@ -1062,18 +1142,28 @@ fn draw_stats(f: &mut Frame, s: &StatsTab, app: &App) {
     ])
     .areas(f.area());
     let week = &s.days[s.days.len().saturating_sub(7)..];
-    let mut head_lines = vec![Line::from(vec![
-        Span::styled("issuewright stats", Style::new().bold()),
-        Span::styled("  last 7 days  ", dim()),
-        Span::styled(
-            if s.counting_tokens() {
-                "counting tokens in the transcripts…"
-            } else {
-                ""
-            },
-            Style::new().yellow(),
-        ),
-    ])];
+    let mut head_spans = vec![
+        Span::styled("issuewright", Style::new().bold()),
+        "  ".into(),
+    ];
+    head_spans.extend(tabs(true));
+    let mut head_lines = vec![Line::from(
+        [
+            head_spans,
+            vec![
+                Span::styled("last 7 days  ", dim()),
+                Span::styled(
+                    if s.counting_tokens() {
+                        "counting tokens in the transcripts…"
+                    } else {
+                        ""
+                    },
+                    Style::new().yellow(),
+                ),
+            ],
+        ]
+        .concat(),
+    )];
     if week.is_empty() {
         head_lines.push(Line::styled("No events in issuewright's log yet.", dim()));
     } else {
@@ -1114,32 +1204,19 @@ fn draw_stats(f: &mut Frame, s: &StatsTab, app: &App) {
     }
     f.render_widget(bars, chart);
 
-    let (header, rows) = stats::table(&s.days);
-    let widths: Vec<Constraint> = header
-        .iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let w = rows
-                .iter()
-                .map(|r| r[i].chars().count())
-                .chain([h.chars().count()])
-                .max()
-                .unwrap_or(1);
-            Constraint::Length(w as u16)
-        })
-        .collect();
-    let rows: Vec<Row> = rows.into_iter().map(Row::new).collect();
-    f.render_widget(
-        Table::new(rows, widths)
-            .header(Row::new(header).style(Style::new().bold()))
-            .column_spacing(2)
-            .block(
-                Block::bordered()
-                    .title(" per day, newest first ")
-                    .border_style(dim()),
-            ),
-        table,
-    );
+    let [work, flow] = stats::tables(&s.days);
+    let [work_area, flow_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).areas(table);
+    for ((header, rows), area, title) in [
+        (work, work_area, " what got done, per day "),
+        (
+            flow,
+            flow_area,
+            " how long, what it cost, and the backlog at the day's last poll ",
+        ),
+    ] {
+        f.render_widget(stats_table(header, rows, title), area);
+    }
     let line = match &app.message {
         Some((m, at)) if at.elapsed() < Duration::from_secs(6) => {
             Line::styled(m.clone(), Style::new().yellow())
@@ -1158,7 +1235,7 @@ fn footer_line(f: &mut Frame, area: Rect, app: &App) {
             Line::styled(m.clone(), Style::new().yellow())
         }
         _ => Line::styled(
-            "q quit · Tab/1-3 pane · 4 stats · ↑↓ jk PgUp PgDn g G select · Enter go to session · o open on GitHub · r reload",
+            "q quit · Tab/1-3 pane · 4 Stats tab · ↑↓ jk PgUp PgDn g G select · Enter go to session · o open on GitHub · r reload",
             dim(),
         ),
     };

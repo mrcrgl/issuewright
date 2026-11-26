@@ -351,6 +351,67 @@ pub fn analyze(nodes: &[Node], plan: &Plan) -> Vec<Stall> {
     out
 }
 
+/// How much work there is, by who it waits on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backlog {
+    /// Ready, nothing in their way: they start as slots free up.
+    pub qualified: usize,
+    /// Ready, waiting only on blockers that move on their own.
+    pub behind_moving: usize,
+    /// Ready, waiting on at least one blocker that won't move until you act.
+    pub held: usize,
+    /// `dispatch:needs-input`: waiting for your answer.
+    pub needs_input: usize,
+    /// Ready but `status:blocked`.
+    pub parked: usize,
+    /// A session or GitHub works on them: running, in CI, in review, merging.
+    pub in_flight: usize,
+}
+
+impl Backlog {
+    /// Issues that get done without you: what's qualified, and what waits
+    /// only on work in flight.
+    pub fn unattended(&self) -> usize {
+        self.qualified + self.behind_moving
+    }
+}
+
+/// The backlog of the plan and graph of one poll.
+pub fn backlog(nodes: &[Node], plan: &Plan) -> Backlog {
+    let stalls = analyze(nodes, plan);
+    let held: BTreeSet<Key> = stalls
+        .iter()
+        .filter(|s| !s.end.flows())
+        .flat_map(|s| s.tree.iter().map(|l| l.issue.key()))
+        .collect();
+    let mut b = Backlog::default();
+    for e in &plan.entries {
+        if matches!(e.verdict, Verdict::Skipped(_)) {
+            continue;
+        }
+        if !waits(nodes, &e.issue) {
+            b.qualified += 1;
+        } else if held.contains(&e.issue.key()) {
+            b.held += 1;
+        } else {
+            b.behind_moving += 1;
+        }
+    }
+    for n in nodes.iter().filter(|n| n.state == IssueState::Open) {
+        if n.has(NEEDS_INPUT) {
+            b.needs_input += 1;
+        } else if n.has(READY) && n.has(STATUS_BLOCKED) {
+            b.parked += 1;
+        } else if [RUNNING, CI, REVIEW, CHANGES, APPROVED, MERGING]
+            .iter()
+            .any(|l| n.has(l))
+        {
+            b.in_flight += 1;
+        }
+    }
+    b
+}
+
 /// Whether the issue waits on an open blocker, as the scheduler sees it.
 pub fn waits(nodes: &[Node], r: &IssueRef) -> bool {
     let open = |b: &IssueRef| nodes.iter().any(|n| n.issue.key() == b.key() && !n.done);
@@ -501,6 +562,50 @@ mod tests {
         assert_eq!(s[0].at.number, 2);
         assert_eq!(s[0].tree[0].also, [IssueRef::new("acme/app", 1)]);
         assert_eq!(s[1].tree[0].also, [IssueRef::new("acme/app", 2)]);
+    }
+
+    #[test]
+    fn backlog_splits_ready_work_by_what_it_waits_on() {
+        let g = [
+            n(1, &[RUNNING], &[]),
+            n(2, &[READY], &[1]),
+            n(3, &[READY], &[2]),
+            n(4, &[NEEDS_INPUT], &[]),
+            n(5, &[READY], &[1, 4]),
+            n(6, &[READY], &[]),
+            n(7, &[READY, STATUS_BLOCKED], &[]),
+        ];
+        let entry = |k: u64, v: Verdict| crate::scheduler::Entry {
+            issue: IssueRef::new("acme/app", k),
+            title: String::new(),
+            epic: None,
+            verdict: v,
+            unlocks: 0,
+        };
+        let waiting = || Verdict::Waiting("waiting on".into());
+        let plan = Plan {
+            entries: vec![
+                entry(6, Verdict::Claim),
+                entry(2, waiting()),
+                entry(3, waiting()),
+                entry(5, waiting()),
+                entry(7, Verdict::Skipped("labeled status:blocked".into())),
+            ],
+            ..Plan::default()
+        };
+        let b = backlog(&g, &plan);
+        assert_eq!(
+            b,
+            Backlog {
+                qualified: 1,
+                behind_moving: 2,
+                held: 1,
+                needs_input: 1,
+                parked: 1,
+                in_flight: 1,
+            }
+        );
+        assert_eq!(b.unattended(), 3);
     }
 
     #[test]
