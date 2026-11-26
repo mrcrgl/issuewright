@@ -673,6 +673,10 @@ impl Daemon {
         };
         status.record_usage(Utc::now(), self.state.locks()?.len());
         self.state.save_status(&status)?;
+        let backlog = crate::graph::backlog(&status.graph, &status.plan);
+        if let Err(e) = self.state.record_backlog(Utc::now(), backlog) {
+            self.log(&format!("couldn't record the backlog: {e:#}"));
+        }
         Ok(claimed)
     }
 
