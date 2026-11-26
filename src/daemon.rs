@@ -1741,7 +1741,18 @@ impl Daemon {
         if verdict == CiVerdict::Pending || !self.still_waits_for_ci(r) {
             return Ok(());
         }
-        if verdict == CiVerdict::Green {
+        // GitHub runs no workflow on a PR that conflicts with its base, so
+        // "no checks" there means "no CI yet", not "a repository without CI".
+        let mut conflicts = false;
+        if verdict == CiVerdict::Green && checks.state.is_none() {
+            match self.gh.mergeable(&pr.r)?.0.as_str() {
+                "CONFLICTING" => conflicts = true,
+                // GitHub hasn't computed it yet; ask again next poll.
+                "UNKNOWN" => return Ok(()),
+                _ => {}
+            }
+        }
+        if verdict == CiVerdict::Green && !conflicts {
             self.gh.edit_labels(r, &[REVIEW], &[CI])?;
             let what = if checks.state.is_some() {
                 "CI is green"
@@ -1763,6 +1774,28 @@ impl Daemon {
             .repo(&r.repo)
             .context("repo not configured")?
             .clone();
+        if conflicts {
+            let wake = Wake::Conflicts {
+                head_sha: &checks.head_sha,
+                approved: false,
+            };
+            return match w.sessions.get(&key).cloned() {
+                Some(conv) if self.has_capacity(&repo)? => {
+                    self.resume(issue, &repo, &pr, &conv, &wake)
+                }
+                Some(_) => Ok(()),
+                None => self.hand_back(
+                    r,
+                    CI,
+                    &format!(
+                        "{}\n\nissuewright has no session of this issue to resume (it started before issuewright \
+                         recorded them). {}",
+                        wake.what(&pr.r),
+                        wake.by_hand()
+                    ),
+                ),
+            };
+        }
         let Some(conv) = w.sessions.get(&key).cloned() else {
             return self.hand_back(
                 r,
@@ -1838,17 +1871,20 @@ impl Daemon {
                 branch: &reset.branch,
                 moved_from,
             }),
-            Wake::Conflicts { head_sha } => session::render_rebase_prompt(&session::RebaseVars {
-                mode: self.opts.mode,
-                repo: &r.repo,
-                number: r.number,
-                pr: &pr.r,
-                head_sha,
-                default_branch: &reset.default_branch,
-                dir: &slot.dir,
-                branch: &reset.branch,
-                moved_from,
-            }),
+            Wake::Conflicts { head_sha, approved } => {
+                session::render_rebase_prompt(&session::RebaseVars {
+                    mode: self.opts.mode,
+                    repo: &r.repo,
+                    number: r.number,
+                    pr: &pr.r,
+                    head_sha,
+                    default_branch: &reset.default_branch,
+                    approved: *approved,
+                    dir: &slot.dir,
+                    branch: &reset.branch,
+                    moved_from,
+                })
+            }
             Wake::ChangesRequested { head_sha, round } => {
                 session::render_changes_requested_prompt(&session::ChangesRequestedVars {
                     mode: self.opts.mode,
@@ -1984,6 +2020,7 @@ impl Daemon {
         }
         let wake = Wake::Conflicts {
             head_sha: &pr.head_sha,
+            approved: true,
         };
         match conv {
             Some(c) => self.resume(issue, &repo, &pr, &c, &wake),
@@ -2394,9 +2431,11 @@ fn question_handoff(l: &SlotLock, timeout: u64) -> String {
 enum Wake<'a> {
     /// CI failed on the PR's head; the issue was `dispatch:ci`.
     CiFailed(&'a Checks),
-    /// The approved PR at `head_sha` conflicts with the default branch; the
-    /// issue was `dispatch:merging`, and its auto-merge is off now.
-    Conflicts { head_sha: &'a str },
+    /// The PR at `head_sha` conflicts with the default branch. Approved, the
+    /// issue was `dispatch:merging` and its auto-merge is off now; otherwise
+    /// it was `dispatch:ci`, with no checks because GitHub runs none on a PR
+    /// that can't merge.
+    Conflicts { head_sha: &'a str, approved: bool },
     /// The reviewer requested changes on the PR at `head_sha`; the issue was
     /// `dispatch:changes-requested`. `round` counts from 1.
     ChangesRequested { head_sha: &'a str, round: u32 },
@@ -2411,7 +2450,10 @@ impl Wake<'_> {
     fn label(&self) -> &'static str {
         match self {
             Wake::CiFailed(_) => CI,
-            Wake::Conflicts { .. } => MERGING,
+            Wake::Conflicts { approved: true, .. } => MERGING,
+            Wake::Conflicts {
+                approved: false, ..
+            } => CI,
             Wake::ChangesRequested { .. } => CHANGES,
         }
     }
@@ -2422,7 +2464,10 @@ impl Wake<'_> {
     fn removes(&self) -> &'static [&'static str] {
         match self {
             Wake::CiFailed(_) => &[CI],
-            Wake::Conflicts { .. } => &[MERGING],
+            Wake::Conflicts { approved: true, .. } => &[MERGING],
+            Wake::Conflicts {
+                approved: false, ..
+            } => &[CI],
             Wake::ChangesRequested { .. } => &[CHANGES, REVIEW],
         }
     }
@@ -2435,7 +2480,17 @@ impl Wake<'_> {
                 c.head_sha,
                 failed_list(c)
             ),
-            Wake::Conflicts { head_sha } => format!(
+            Wake::Conflicts {
+                head_sha,
+                approved: false,
+            } => format!(
+                "{pr} at `{head_sha}` conflicts with the default branch. GitHub runs no CI on a pull request that \
+                 can't merge, so it has no checks to review it by."
+            ),
+            Wake::Conflicts {
+                head_sha,
+                approved: true,
+            } => format!(
                 "{pr} was approved at `{head_sha}`, but it conflicts with the default branch, so it can't merge. \
                  issuewright turned its auto-merge off, so a rebased commit can't merge on the old approval."
             ),
@@ -2473,7 +2528,7 @@ impl Wake<'_> {
     fn log(&self, pr: &IssueRef) -> String {
         match self {
             Wake::CiFailed(c) => format!("CI failed on {pr} at {:.7}", c.head_sha),
-            Wake::Conflicts { head_sha } => {
+            Wake::Conflicts { head_sha, .. } => {
                 format!("{pr} at {head_sha:.7} conflicts with the default branch")
             }
             Wake::ChangesRequested { head_sha, round } => {
