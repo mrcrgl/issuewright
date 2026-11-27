@@ -48,6 +48,9 @@ pub struct Daemon {
     review_repos: BTreeSet<String>,
     /// Epics seen closed, so later polls don't look them up again.
     closed_epics: BTreeSet<(String, u64)>,
+    /// Why epics whose sub-issues are all closed weren't checked this poll,
+    /// for the plan's notes.
+    epic_notes: Vec<String>,
     /// The config file as last loaded, and its modification time, to notice
     /// edits.
     config_text: String,
@@ -123,6 +126,7 @@ impl Daemon {
             app,
             review_repos: BTreeSet::new(),
             closed_epics: BTreeSet::new(),
+            epic_notes: Vec::new(),
             config_text,
             config_mtime,
             errors: RefCell::default(),
@@ -527,6 +531,14 @@ impl Daemon {
                     lock.name, lock.slot, lock.repo
                 ));
             }
+            if lock.kind == Kind::EpicCheck
+                && let Err(e) = self.record_epic_check(snap, &lock.issue)
+            {
+                self.log(&format!(
+                    "{}: couldn't record the epic check: {e:#}",
+                    lock.name
+                ));
+            }
             self.state.remove_lock(&lock)?;
         }
         Ok(())
@@ -641,6 +653,7 @@ impl Daemon {
         self.comment_epics_without_sub_issues(&snap)?;
 
         let mut plan_out = plan.clone();
+        plan_out.notes.extend(self.epic_notes.iter().cloned());
         for entry in plan.claims() {
             let res = self.claim(entry, &snap, &mut hist);
             let why = res.as_ref().err().map(|e| format!("claim failed: {e:#}"));
@@ -1278,6 +1291,7 @@ impl Daemon {
     /// closed, while slots are free. The epics are those issuewright scheduled
     /// sub-issues of (its history) and those carrying a `dispatch:*` label.
     fn start_epic_checks(&mut self, snap: &Snapshot) -> Result<()> {
+        self.epic_notes.clear();
         let mut epics: BTreeMap<(String, u64), IssueRef> = BTreeMap::new();
         for key in self.state.history()?.epic_first_claim.keys() {
             if let Some((repo, n)) = key.rsplit_once('#')
@@ -1301,12 +1315,19 @@ impl Daemon {
         }
         let refs: Vec<IssueRef> = epics.into_values().collect();
         let briefs = self.gh.issue_briefs(&refs)?;
+        let checked = self.state.epic_checks()?;
         for b in briefs.values() {
             if b.state != IssueState::Open {
                 self.closed_epics.insert(b.r.key());
                 continue;
             }
             if !epic_needs_check(b) {
+                continue;
+            }
+            let blockers = self.blockers_done(snap, &b.blockers)?;
+            let last = checked.get(&epic_key(&b.r));
+            if let Err(why) = epic_check_due(b, &blockers, last) {
+                self.epic_notes.push(why);
                 continue;
             }
             let repo = self
@@ -1321,6 +1342,61 @@ impl Daemon {
             self.attempted(&b.r, res, "starting the epic check");
         }
         Ok(())
+    }
+
+    /// Each of `blockers` with whether it's done: as the scheduler judges it
+    /// when the snapshot has it, else done once closed as completed.
+    fn blockers_done(
+        &self,
+        snap: &Snapshot,
+        blockers: &[IssueRef],
+    ) -> Result<Vec<(IssueRef, bool)>> {
+        let policy = self.policy();
+        let missing: Vec<IssueRef> = blockers
+            .iter()
+            .filter(|b| snap.status(b).is_none())
+            .cloned()
+            .collect();
+        let fetched = if missing.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.gh.issue_briefs(&missing)?
+        };
+        Ok(blockers
+            .iter()
+            .map(|b| {
+                let done = match snap.status(b) {
+                    Some(s) => crate::scheduler::blocker_done(s, &policy),
+                    None => fetched
+                        .get(&b.key())
+                        .is_some_and(|x| x.state == IssueState::ClosedCompleted),
+                };
+                (b.clone(), done)
+            })
+            .collect())
+    }
+
+    /// An epic check ended. While its epic stays open, remembers what it saw,
+    /// so the same epic isn't checked again until something changes.
+    fn record_epic_check(&self, snap: &Snapshot, epic: &IssueRef) -> Result<()> {
+        let mut checked = self.state.epic_checks()?;
+        let brief = self.gh.issue_briefs(std::slice::from_ref(epic))?;
+        match brief.get(&epic.key()) {
+            Some(b) if b.state == IssueState::Open => {
+                let blockers = self.blockers_done(snap, &b.blockers)?;
+                checked.insert(
+                    epic_key(epic),
+                    crate::state::EpicChecked {
+                        at: Utc::now(),
+                        fingerprint: epic_fingerprint(b, &blockers),
+                    },
+                );
+            }
+            _ => {
+                checked.remove(&epic_key(epic));
+            }
+        }
+        self.state.save_epic_checks(&checked)
     }
 
     fn claim_epic_check(&self, epic: &IssueBrief, repo: &RepoConfig) -> Result<()> {
@@ -2400,6 +2476,82 @@ pub fn epic_needs_check(b: &IssueBrief) -> bool {
         && !b.has_label(NEEDS_INPUT)
 }
 
+fn epic_key(r: &IssueRef) -> String {
+    format!("{}#{}", r.repo.to_lowercase(), r.number)
+}
+
+/// Whether an epic that [`epic_needs_check`] is due for a check now, or why
+/// not: it's parked with `status:blocked`, it waits on an open blocker, or
+/// nothing changed since the last check left it open. `dispatch:ready` on
+/// the epic asks for a check anyway.
+pub fn epic_check_due(
+    b: &IssueBrief,
+    blockers: &[(IssueRef, bool)],
+    last: Option<&crate::state::EpicChecked>,
+) -> std::result::Result<(), String> {
+    let e = b.r.short();
+    if b.has_label(STATUS_BLOCKED) {
+        return Err(format!(
+            "skipped: epic check of {e}, it is {STATUS_BLOCKED}"
+        ));
+    }
+    let open: Vec<String> = blockers
+        .iter()
+        .filter(|(_, done)| !done)
+        .map(|(r, _)| r.short())
+        .collect();
+    if !open.is_empty() {
+        return Err(format!(
+            "skipped: epic check of {e}, waiting on {}",
+            open.join(", ")
+        ));
+    }
+    if let Some(l) = last
+        && !b.has_label(READY)
+        && l.fingerprint == epic_fingerprint(b, blockers)
+    {
+        return Err(format!(
+            "skipped: epic check of {e} unchanged since {} (set {READY} on it to check it again)",
+            l.at.format("%Y-%m-%d %H:%M UTC")
+        ));
+    }
+    Ok(())
+}
+
+/// What an epic check judges, as a short stable hash: the epic's body, its
+/// labels but those issuewright moves it through (`dispatch:running`,
+/// `needs-input`, `ready`), its sub-issues, and its blockers with whether
+/// each is done.
+pub fn epic_fingerprint(b: &IssueBrief, blockers: &[(IssueRef, bool)]) -> String {
+    let mut labels: Vec<String> = b
+        .labels
+        .iter()
+        .map(|l| l.to_lowercase())
+        .filter(|l| ![RUNNING, NEEDS_INPUT, READY].contains(&l.as_str()))
+        .collect();
+    labels.sort();
+    let mut deps: Vec<String> = blockers
+        .iter()
+        .map(|(r, done)| format!("{}#{}:{done}", r.repo.to_lowercase(), r.number))
+        .collect();
+    deps.sort();
+    let text = format!(
+        "{}\n{}\n{}/{}\n{}",
+        b.body,
+        labels.join(","),
+        b.sub_issues,
+        b.sub_issues_closed,
+        deps.join(",")
+    );
+    // FNV-1a: stable across builds, unlike the standard library's hasher.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 /// Why issuewright resumes an implementing session.
 /// How long after moving its question to GitHub a session is still resumed
 /// rather than started afresh.
@@ -2837,7 +2989,71 @@ mod tests {
             labels: labels.iter().map(|l| l.to_string()).collect(),
             sub_issues: subs,
             sub_issues_closed: closed,
+            body: String::new(),
+            blockers: vec![],
         }
+    }
+
+    fn epic(labels: &[&str]) -> IssueBrief {
+        IssueBrief {
+            body: "- [ ] live on AZ1\n".into(),
+            ..brief(IssueState::Open, labels, 3, 3)
+        }
+    }
+
+    fn checked(b: &IssueBrief, blockers: &[(IssueRef, bool)]) -> crate::state::EpicChecked {
+        crate::state::EpicChecked {
+            at: "2026-11-27T08:00:00Z".parse().unwrap(),
+            fingerprint: epic_fingerprint(b, blockers),
+        }
+    }
+
+    #[test]
+    fn a_parked_epic_is_not_checked() {
+        let b = epic(&[STATUS_BLOCKED]);
+        assert!(epic_needs_check(&b));
+        let why = epic_check_due(&b, &[], None).unwrap_err();
+        assert!(why.contains(STATUS_BLOCKED), "{why}");
+        assert_eq!(epic_check_due(&epic(&[]), &[], None), Ok(()));
+    }
+
+    #[test]
+    fn an_epic_with_an_open_blocker_is_not_checked() {
+        let b = epic(&[]);
+        let dep = IssueRef::new("acme/app", 3);
+        let why = epic_check_due(&b, &[(dep.clone(), false)], None).unwrap_err();
+        assert!(why.contains("waiting on app#3"), "{why}");
+        assert_eq!(epic_check_due(&b, &[(dep, true)], None), Ok(()));
+    }
+
+    #[test]
+    fn an_unchanged_epic_is_not_checked_again() {
+        let b = epic(&[]);
+        let last = checked(&b, &[]);
+        let why = epic_check_due(&b, &[], Some(&last)).unwrap_err();
+        assert!(
+            why.contains("unchanged since 2026-11-27 08:00 UTC"),
+            "{why}"
+        );
+        // The labels issuewright moves it through don't count as a change:
+        // removing needs-input doesn't start the loop again.
+        let after = epic(&[NEEDS_INPUT]);
+        assert_eq!(epic_fingerprint(&after, &[]), last.fingerprint);
+        // A change to the body, a label set by hand, a closed blocker or
+        // dispatch:ready do.
+        let edited = IssueBrief {
+            body: "- [x] live on AZ1\n".into(),
+            ..epic(&[])
+        };
+        assert_eq!(epic_check_due(&edited, &[], Some(&last)), Ok(()));
+        assert_eq!(
+            epic_check_due(&epic(&["area:core"]), &[], Some(&last)),
+            Ok(())
+        );
+        assert_eq!(epic_check_due(&epic(&[READY]), &[], Some(&last)), Ok(()));
+        let dep = IssueRef::new("acme/app", 3);
+        let was_open = checked(&b, &[(dep.clone(), false)]);
+        assert_eq!(epic_check_due(&b, &[(dep, true)], Some(&was_open)), Ok(()));
     }
 
     #[test]

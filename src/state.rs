@@ -157,6 +157,15 @@ pub fn add_backlog(
     history.retain(|s| s.at > since);
 }
 
+/// The last epic check that left its epic open, keyed by `owner/name#n`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpicChecked {
+    pub at: DateTime<Utc>,
+    /// What the check saw: the epic's body, labels, sub-issues and blockers
+    /// (see `daemon::epic_fingerprint`).
+    pub fingerprint: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CiSeen {
     pub head_sha: String,
@@ -307,6 +316,13 @@ impl State {
 
     pub fn session_dir(&self) -> PathBuf {
         self.dir.join("sessions")
+    }
+
+    pub fn epic_checks(&self) -> Result<BTreeMap<String, EpicChecked>> {
+        read_json(&self.dir.join("epic_checks.json"))
+    }
+    pub fn save_epic_checks(&self, c: &BTreeMap<String, EpicChecked>) -> Result<()> {
+        write_json(&self.dir.join("epic_checks.json"), c)
     }
 
     pub fn history(&self) -> Result<History> {

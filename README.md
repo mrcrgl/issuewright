@@ -130,6 +130,9 @@ The summary adds p90s, the share of PRs with a red CI round, the share of implem
 **Closing an epic.** When all sub-issues of an epic are closed, issuewright starts an epic-check session `<repo>#<number>-epic` (with `check_epics`, on by default). It covers epics that issuewright scheduled sub-issues of, and epics carrying a `dispatch:*` label. The session runs on the current default branch and can't commit or push. It checks each acceptance criterion of the epic against the merged code, PRs and sub-issues, and ticks the met checkboxes in the epic's body.
 - All met: it comments the evidence and closes the epic.
 - Some open: it proposes follow-up issues. Once you confirm, it creates them as new `dispatch:ready` sub-issues and releases the epic, which gets scheduled again. If you decline, or in unattended mode, it sets `dispatch:needs-input` with the open criteria. Set `dispatch:ready` on the epic to check it again.
+- Open only until other work ships (a criterion that can only be checked live once another issue has landed): it adds that issue to the epic's blockers, comments which criterion waits on it, and releases the epic.
+
+An epic isn't checked while it's `status:blocked`, or while one of its blockers is open: its native blocked-by links and its `Dependencies / Blockers` section count, as for any issue. When a check leaves the epic open, issuewright remembers what it saw (`epic_checks.json` in its state directory): the body, the labels it doesn't set itself, the sub-issues, and the blockers with whether each is done. It doesn't check the epic again until one of them changes, or you set `dispatch:ready` on it. The plan's notes say why an epic waits, for example `skipped: epic check of app#40 unchanged since 2026-11-27 08:00 UTC`.
 
 The check's prompt is [`src/epic_check_prompt.md`](src/epic_check_prompt.md), or `epic_check_prompt_template`.
 
