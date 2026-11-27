@@ -711,7 +711,7 @@ pub fn parse_checks(commit: &Value) -> Option<Checks> {
     })
 }
 
-const BRIEF_FIELDS: &str = "title state stateReason labels(first: 50) { nodes { name } } subIssuesSummary { total completed }";
+const BRIEF_FIELDS: &str = "title body state stateReason labels(first: 50) { nodes { name } } subIssuesSummary { total completed } blockedBy(first: 50) { nodes { number repository { nameWithOwner } } }";
 
 /// What issuewright needs to know about an issue outside the snapshot: a
 /// session's issue that left it, or an epic whose sub-issues may all be closed.
@@ -723,6 +723,10 @@ pub struct IssueBrief {
     pub labels: Vec<String>,
     pub sub_issues: u64,
     pub sub_issues_closed: u64,
+    pub body: String,
+    /// Its native blocked-by links, then the issues its `Dependencies /
+    /// Blockers` section names, without duplicates.
+    pub blockers: Vec<IssueRef>,
 }
 
 impl IssueBrief {
@@ -735,6 +739,21 @@ impl IssueBrief {
 }
 
 fn parse_brief(r: &IssueRef, v: &Value) -> Option<IssueBrief> {
+    let body = str_at(v, &["body"]).unwrap_or_default().to_string();
+    let mut blockers: Vec<IssueRef> = Vec::new();
+    let native = nodes(v, "blockedBy").into_iter().filter_map(|b| {
+        let repo = str_at(&b, &["repository", "nameWithOwner"])?;
+        Some(IssueRef::new(repo, b.get("number")?.as_u64()?))
+    });
+    for b in native
+        .collect::<Vec<_>>()
+        .into_iter()
+        .chain(dependency_refs(&body, &r.repo))
+    {
+        if b.key() != r.key() && !blockers.iter().any(|x| x.key() == b.key()) {
+            blockers.push(b);
+        }
+    }
     Some(IssueBrief {
         r: r.clone(),
         title: str_at(v, &["title"]).unwrap_or_default().to_string(),
@@ -745,6 +764,8 @@ fn parse_brief(r: &IssueRef, v: &Value) -> Option<IssueBrief> {
             .collect(),
         sub_issues: v["subIssuesSummary"]["total"].as_u64().unwrap_or(0),
         sub_issues_closed: v["subIssuesSummary"]["completed"].as_u64().unwrap_or(0),
+        body,
+        blockers,
     })
 }
 
@@ -1413,5 +1434,23 @@ exit 0
                 .is_empty()
         );
         assert!(snap.others.is_empty());
+    }
+
+    #[test]
+    fn a_brief_names_native_and_body_blockers_once() {
+        let r = IssueRef::new("acme/mono", 7);
+        let b = parse_brief(
+            &r,
+            &json!({"title": "Epic", "state": "OPEN", "labels": {"nodes": []},
+                    "subIssuesSummary": {"total": 2, "completed": 2},
+                    "body": "### Dependencies / Blockers\n\n- #3\n- #2\n- #7\n",
+                    "blockedBy": {"nodes": [{"number": 2, "repository": {"nameWithOwner": "acme/mono"}}]}}),
+        )
+        .unwrap();
+        assert_eq!(
+            b.blockers,
+            [IssueRef::new("acme/mono", 2), IssueRef::new("acme/mono", 3)]
+        );
+        assert!(b.body.starts_with("### Dependencies"));
     }
 }
