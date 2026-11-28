@@ -183,9 +183,16 @@ pub struct SessionConfig {
     /// (`gh_user`) is used when unset.
     #[serde(default)]
     pub gh_token_command: Option<String>,
-    /// Pass `SSH_AUTH_SOCK` through. Off by default.
+    /// Pass `SSH_AUTH_SOCK` through. Off by default. With `signing_key`,
+    /// sessions get issuewright's signing agent instead.
     #[serde(default)]
     pub ssh_agent: bool,
+    /// A private SSH key without a passphrase that signs the sessions'
+    /// commits, such as `~/.ssh/id_ed25519_signing`. issuewright loads it
+    /// into an agent of its own; sessions sign through the agent and never
+    /// read the key. Register it on GitHub as a signing key.
+    #[serde(default)]
+    pub signing_key: Option<PathBuf>,
     /// Turn the Bash sandbox off. Only for hosts without bubblewrap/socat;
     /// the credential paths then stay readable from Bash.
     #[serde(default)]
@@ -235,6 +242,7 @@ impl Default for SessionConfig {
             deny: Vec::new(),
             gh_token_command: None,
             ssh_agent: false,
+            signing_key: None,
             disable_sandbox: false,
             builtin_deny: true,
             builtin_deny_read: true,
@@ -332,10 +340,10 @@ pub struct RepoConfig {
     /// token and without `~/.ssh`.
     #[serde(default)]
     pub clone_url: Option<String>,
-    /// Sign commits in the slots. Off by default: the signing key is usually
-    /// under `~/.ssh`, which the session can't read.
+    /// Sign the sessions' commits with `session.signing_key`. On by default
+    /// when that is set; `false` leaves this repository's commits unsigned.
     #[serde(default)]
-    pub sign_commits: bool,
+    pub sign_commits: Option<bool>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -353,6 +361,12 @@ pub struct RepoConfig {
 }
 
 impl RepoConfig {
+    /// Whether this repository's sessions sign their commits: with a
+    /// `session.signing_key`, unless `sign_commits = false`.
+    pub fn signs(&self, cfg_has_key: bool) -> bool {
+        cfg_has_key && self.sign_commits != Some(false)
+    }
+
     pub fn owner_name(&self) -> (&str, &str) {
         self.name
             .split_once('/')
@@ -377,6 +391,7 @@ impl Config {
         let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.home = expand_home(&cfg.home);
+        cfg.session.signing_key = cfg.session.signing_key.as_deref().map(expand_home);
         cfg.prompt_template = cfg.prompt_template.as_deref().map(expand_home);
         cfg.review_prompt_template = cfg.review_prompt_template.as_deref().map(expand_home);
         cfg.pr_review_prompt_template = cfg.pr_review_prompt_template.as_deref().map(expand_home);

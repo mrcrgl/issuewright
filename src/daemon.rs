@@ -48,6 +48,8 @@ pub struct Daemon {
     review_repos: BTreeSet<String>,
     /// Epics seen closed, so later polls don't look them up again.
     closed_epics: BTreeSet<(String, u64)>,
+    /// The agent that signs the sessions' commits (`session.signing_key`).
+    signing: Option<crate::signing::Agent>,
     /// Why epics whose sub-issues are all closed weren't checked this poll,
     /// for the plan's notes.
     epic_notes: Vec<String>,
@@ -114,6 +116,11 @@ impl Daemon {
         };
         let config_mtime = mtime(&opts.config);
         let config_text = std::fs::read_to_string(&opts.config).unwrap_or_default();
+        let signing = if opts.dry_run {
+            None
+        } else {
+            crate::signing::Agent::start(&cfg).context("session.signing_key")?
+        };
         Ok(Self {
             cfg,
             opts,
@@ -126,6 +133,7 @@ impl Daemon {
             app,
             review_repos: BTreeSet::new(),
             closed_epics: BTreeSet::new(),
+            signing,
             epic_notes: Vec::new(),
             config_text,
             config_mtime,
@@ -435,6 +443,10 @@ impl Daemon {
         if new.gh_user != self.cfg.gh_user {
             new.gh_user = self.cfg.gh_user.clone();
             on_restart.push("gh_user");
+        }
+        if new.session.signing_key != self.cfg.session.signing_key {
+            new.session.signing_key = self.cfg.session.signing_key.clone();
+            on_restart.push("session.signing_key");
         }
         for r in &new.repos {
             if self.cfg.repo(&r.name).is_none()
@@ -830,6 +842,14 @@ impl Daemon {
     /// `avoid_merged`, a branch whose remote tip was already merged as a PR is
     /// not continued; the work starts afresh from the default branch on
     /// `<branch>-2`.
+    /// The public key `repo`'s sessions sign with, if they sign.
+    fn signing_key(&self, repo: &RepoConfig) -> Option<&str> {
+        self.signing
+            .as_ref()
+            .filter(|_| repo.signs(true))
+            .map(|a| a.public_key.as_str())
+    }
+
     fn prepare_slot(
         &self,
         repo: &RepoConfig,
@@ -855,7 +875,7 @@ impl Daemon {
                 names.join(", ")
             ));
         }
-        slots::ensure(&slot, repo, token)?;
+        slots::ensure(&slot, repo, token, self.signing_key(repo))?;
         let branch = if avoid_merged {
             let b = slots::unmerged_branch(branch, |b| {
                 Ok((
@@ -910,7 +930,12 @@ impl Daemon {
                 .session_dir()
                 .join(format!("{}-{}.settings.json", repo.short(), index));
         std::fs::write(&settings_path, serde_json::to_vec_pretty(&settings)?)?;
-        let mut env = session::environment(&self.cfg, repo, slot, l.gh_token);
+        let signing = self
+            .signing
+            .as_ref()
+            .filter(|_| repo.signs(true))
+            .map(|a| (a.socket.as_path(), a.public_key.as_str()));
+        let mut env = session::environment(&self.cfg, repo, slot, l.gh_token, signing);
         // The key that lets this session, and only it, use `issuewright session …`.
         let key = session::new_session_id()?;
         crate::tools::write_record(&crate::tools::Record {

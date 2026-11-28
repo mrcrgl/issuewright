@@ -576,11 +576,14 @@ fn generated_settings(
 }
 
 /// The session's whole environment; nothing else is inherited.
+/// The environment of a session. `signing` is the signing agent's socket
+/// and public key when the repository's commits are signed.
 pub fn environment(
     cfg: &Config,
     repo: &RepoConfig,
     slot: &Slot,
     token: &str,
+    signing: Option<(&Path, &str)>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for k in &cfg.session.env_passthrough {
@@ -592,6 +595,24 @@ pub fn environment(
         && let Ok(v) = std::env::var("SSH_AUTH_SOCK")
     {
         env.insert("SSH_AUTH_SOCK".into(), v);
+    }
+    // Git settings by environment apply in every repository the session
+    // touches, the clones it makes itself too, and win over the user's
+    // config (`includeIf` included), whose signing key the sandbox hides.
+    let git: Vec<(&str, String)> = match signing {
+        Some((socket, public_key)) => {
+            env.insert(
+                "SSH_AUTH_SOCK".into(),
+                socket.to_string_lossy().into_owned(),
+            );
+            crate::signing::git_config(public_key).into()
+        }
+        None => vec![("commit.gpgsign", "false".to_string())],
+    };
+    env.insert("GIT_CONFIG_COUNT".into(), git.len().to_string());
+    for (i, (k, v)) in git.into_iter().enumerate() {
+        env.insert(format!("GIT_CONFIG_KEY_{i}"), k.to_string());
+        env.insert(format!("GIT_CONFIG_VALUE_{i}"), v);
     }
     env.insert("GH_TOKEN".into(), token.to_string());
     env.insert(
@@ -788,6 +809,34 @@ deny = ["Bash(rm -rf *)"]
             permission_mode(&other, &other.repos[0]),
             Some("acceptEdits")
         );
+    }
+
+    #[test]
+    fn git_settings_sign_through_the_agent_or_not_at_all() {
+        let cfg: Config = toml::from_str("[[repo]]\nname = \"a/b\"\n").unwrap();
+        let repo = &cfg.repos[0];
+        let slot = Slot::new(&cfg, repo, 1);
+        let socket = Path::new("/home/issuewright/signing/agent.sock");
+        let env = environment(&cfg, repo, &slot, "t", Some((socket, "ssh-ed25519 AAAA")));
+        assert_eq!(env["SSH_AUTH_SOCK"], "/home/issuewright/signing/agent.sock");
+        assert_eq!(env["GIT_CONFIG_COUNT"], "3");
+        let settings: Vec<(&str, &str)> = (0..3)
+            .map(|i| {
+                (
+                    env[&format!("GIT_CONFIG_KEY_{i}")].as_str(),
+                    env[&format!("GIT_CONFIG_VALUE_{i}")].as_str(),
+                )
+            })
+            .collect();
+        assert!(settings.contains(&("user.signingkey", "key::ssh-ed25519 AAAA")));
+        assert!(settings.contains(&("commit.gpgsign", "true")));
+        // Without the agent, nothing tries to sign: the user's own key is
+        // out of the sandbox's reach.
+        let env = environment(&cfg, repo, &slot, "t", None);
+        assert!(!env.contains_key("SSH_AUTH_SOCK"));
+        assert_eq!(env["GIT_CONFIG_COUNT"], "1");
+        assert_eq!(env["GIT_CONFIG_KEY_0"], "commit.gpgsign");
+        assert_eq!(env["GIT_CONFIG_VALUE_0"], "false");
     }
 
     #[test]

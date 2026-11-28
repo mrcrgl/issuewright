@@ -13,6 +13,7 @@ mod model;
 mod scheduler;
 mod session;
 mod setup_app;
+mod signing;
 mod slots;
 mod state;
 mod stats;
@@ -308,7 +309,13 @@ fn show_session(
         None => println!("{settings}"),
     }
     eprintln!("\nEnvironment (nothing else is inherited):");
-    for (k, v) in session::environment(cfg, r, &s, "<token>") {
+    let public_key = match &cfg.session.signing_key {
+        Some(k) if r.signs(true) => Some(signing::public_key(k)?),
+        _ => None,
+    };
+    let socket = signing::socket_path(cfg);
+    let signs = public_key.as_deref().map(|k| (socket.as_path(), k));
+    for (k, v) in session::environment(cfg, r, &s, "<token>", signs) {
         eprintln!("  {k}={v}");
     }
     eprintln!("\nWorking directory: {}", s.dir.display());
