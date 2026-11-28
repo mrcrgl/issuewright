@@ -92,7 +92,11 @@ fn config_locked(e: &anyhow::Error) -> bool {
 }
 
 /// Creates the base clone and the slot's worktree when missing.
-pub fn ensure(slot: &Slot, repo: &RepoConfig, token: &str) -> Result<()> {
+/// Clones the base and adds the slot's worktree if missing, and sets the
+/// base's config. With `signing`, the public key of issuewright's signing
+/// agent, commits in the slot are signed through the agent; without, they
+/// are unsigned, whatever the user's own git config says.
+pub fn ensure(slot: &Slot, repo: &RepoConfig, token: &str, signing: Option<&str>) -> Result<()> {
     if !slot.base.join(".git").exists() {
         let parent = slot.base.parent().unwrap();
         std::fs::create_dir_all(parent)?;
@@ -101,13 +105,14 @@ pub fn ensure(slot: &Slot, repo: &RepoConfig, token: &str) -> Result<()> {
     }
     let base = &slot.base;
     clear_stale_locks(slot)?;
-    set_config(
-        slot,
-        base,
-        token,
-        "commit.gpgsign",
-        if repo.sign_commits { "true" } else { "false" },
-    )?;
+    match signing {
+        Some(public_key) => {
+            for (k, v) in crate::signing::git_config(public_key) {
+                set_config(slot, base, token, k, &v)?;
+            }
+        }
+        None => set_config(slot, base, token, "commit.gpgsign", "false")?,
+    }
     // `git push` without arguments pushes the current branch to its namesake.
     set_config(slot, base, token, "push.default", "current")?;
     if !slot.dir.join(".git").exists() {
@@ -576,7 +581,7 @@ mod tests {
         .unwrap();
         let repo = &cfg.repos[0];
         let slot = Slot::new(&cfg, repo, 1);
-        ensure(&slot, repo, "").unwrap();
+        ensure(&slot, repo, "", None).unwrap();
         let r = reset(&slot, "feat/1-x", "").unwrap();
         assert!(!r.continued);
         sh(
@@ -635,11 +640,11 @@ mod tests {
         assert!(r.continued);
         assert_eq!(sh(&slot.dir, &["rev-list", "--count", "HEAD"]), "2");
         assert!(!lock.exists());
-        ensure(&slot, repo, "").unwrap();
+        ensure(&slot, repo, "", None).unwrap();
 
         // Claimed again in another slot while slot 1 still has the branch.
         let other = Slot::new(&cfg, repo, 2);
-        ensure(&other, repo, "").unwrap();
+        ensure(&other, repo, "", None).unwrap();
         let r = reset(&other, "feat/1-x", "").unwrap();
         assert!(r.continued);
         assert_eq!(sh(&other.dir, &["branch", "--show-current"]), "feat/1-x");

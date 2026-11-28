@@ -257,7 +257,18 @@ Each repository has `slots` persistent git worktrees under `<home>/slots/<repo>/
 
 `target/` survives the reset, so builds stay warm. `CARGO_TARGET_DIR` points at the slot's `target/`, `TMPDIR` at `<home>/slots/<repo>/tmp-<i>`, and `CARGO_HOME` is shared. With `target_dir_max_gb`, a slot's `target/` is removed before its next claim once it grows past that size. Branches are named by `branch_template`, by default `{kind}/{number}-{slug}`, where `{kind}` is `fix` for `type:bug`, `docs` for `type:docs`, `chore` for `type:chore`/`type:spike`, and `feat` otherwise.
 
-Commits in slots are unsigned by default (`sign_commits = false`), because the signing key usually lives under `~/.ssh`, which sessions can't read.
+**Signed commits.** The signing key usually lives under `~/.ssh`, which sessions can't read. Point `session.signing_key` at a private SSH key without a passphrase, registered on GitHub as a signing key:
+
+```toml
+[session]
+signing_key = "~/.ssh/id_ed25519_signing"
+```
+
+issuewright then runs an `ssh-agent` of its own that holds only that key, at `<home>/signing/agent.sock`. The agent starts and stops with issuewright, at the same path each time, so sessions that outlive a restart sign again once the next issuewright is up. Sessions get the agent as `SSH_AUTH_SOCK` and the key's public half inline (`user.signingkey = "key::ssh-ed25519 …"`, `gpg.format = ssh`, `commit.gpgsign = true`). git signs through the agent and never opens a file under `~/.ssh`. The settings go into the slot's git config, for `session rebase` too, and into the session's environment (`GIT_CONFIG_COUNT`, …). The environment wins over your own git config, `includeIf` sections included, in every repository the session touches, clones it makes itself as well. Each commit then shows as verified on GitHub, and PRs merge into branches that require signed commits with any merge method. `sign_commits = false` on a repository leaves its commits unsigned. On Linux the sandbox must reach the agent's socket, which needs `allowAllUnixSockets` (see [Changing the permissions](#changing-the-permissions)).
+
+Whoever can reach the agent can have it sign anything with that key, so use a key that signs only, and nothing else: a session that pushes as you can already author commits as you.
+
+Without `signing_key`, the sessions' commits are unsigned, and the environment sets `commit.gpgsign = false`, so that a commit in a clone the session made itself doesn't fail on a signing key the sandbox hides.
 
 ## Guardrails
 
@@ -277,7 +288,7 @@ Sessions must not reach production. Scrubbing the environment alone doesn't achi
    - `session rerun-ci <run>`: re-runs the failed jobs of a finished `pull_request` or `push` run of the session's own branch, at most up to its third attempt. A re-run of a deploy, or of anything on the default branch, stays impossible.
 
    issuewright lists `<issuewright> session *` in the sandbox's `excludedCommands` and the allow rules, and tells implementing sessions about it in their system prompt. Reviewers don't get it. The session writes the command line and its environment, so neither is trusted: each session gets a key (`ISSUEWRIGHT_SESSION_KEY`), and the command looks the key up in records issuewright writes to `~/.local/state/issuewright/sessions` (home from passwd, not `$HOME`), which every session's sandbox denies reading. git then runs in the slot that record names, with a fixed environment and with hooks off.
-5. **Environment.** Only `session.env_passthrough` (`PATH`, `HOME`, `TERM`, …) plus what issuewright sets: `GH_TOKEN`, an empty `GH_CONFIG_DIR`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `TMPDIR` and `CLAUDE_CODE_SUBAGENT_MODEL` (default `sonnet`), then `[env]` and the repository's `env`. No SSH agent unless `ssh_agent = true`.
+5. **Environment.** Only `session.env_passthrough` (`PATH`, `HOME`, `TERM`, …) plus what issuewright sets: `GH_TOKEN`, an empty `GH_CONFIG_DIR`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `TMPDIR`, `CLAUDE_CODE_SUBAGENT_MODEL` (default `sonnet`) and the git settings for [signed commits](#slots) (`GIT_CONFIG_COUNT`, …), then `[env]` and the repository's `env`. No SSH agent unless `ssh_agent = true`; with `signing_key`, `SSH_AUTH_SOCK` is issuewright's signing agent.
 
 The GitHub token is the remaining risk: it can do whatever its account can. Give sessions a fine-grained token limited to the watched repositories (contents, issues and pull requests read-write; Actions and commit statuses read-only, so sessions can read CI results and logs; no administration) with `session.gh_token_command`.
 
